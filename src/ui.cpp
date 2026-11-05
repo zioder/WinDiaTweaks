@@ -29,6 +29,8 @@
 #include <climits>
 #include <limits>
 #include <winrt/Microsoft.UI.Xaml.Automation.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.Peers.h>
+#include <winrt/Microsoft.UI.Xaml.Automation.Provider.h>
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
 #include <winrt/Microsoft.UI.Xaml.Shapes.h>
@@ -1173,12 +1175,16 @@ static bool ShownOnScreen(mux::FrameworkElement fe) {
     return true;
 }
 
-// The sidebar is open when it's shown, docked or floating over the page. Closing it collapses the
-// grid that holds it.
+namespace open_tabs {
+static bool IsTemporarilyRevealed(const mux::XamlRoot& root);
+}
+
+// A transparent search layout is not a native sidebar-open state.
 static bool ComputeSidebarOpen() {
     for (auto h : FindNodes(L"SidebarBorder")) {
         auto fe = Obj<mux::FrameworkElement>(h);
-        if (fe && fe.ActualWidth() >= 1 && ShownOnScreen(fe)) return true;
+        if (fe && fe.ActualWidth() >= 1 && ShownOnScreen(fe) &&
+            !open_tabs::IsTemporarilyRevealed(fe.XamlRoot())) return true;
     }
     return false;
 }
@@ -2960,10 +2966,14 @@ static void SendKeys(std::initializer_list<std::pair<WORD, bool>> keys) {  // (v
         i.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
         in.push_back(i);
     }
-    SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+    if (SendInput((UINT)in.size(), in.data(), sizeof(INPUT)) != in.size())
+        Log("floating bar: keyboard input was not delivered (error %lu)", GetLastError());
 }
 
+#include "open-tabs.h"
+
 static void StartNewTabMode() {
+    open_tabs::PrepareSidebar();
     t_newTabMode = true;
     // Ctrl is usually still held from Ctrl+T, so only L needs pressing; otherwise press Ctrl+L.
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) SendKeys({{'L', true}, {'L', false}});
@@ -3002,6 +3012,7 @@ static muxc::RichEditBox FocusedNewTabBox() {
 // Enter in the Ctrl+T bar: take what's typed (with Dia's autocomplete), close the bar, open a real new
 // tab, and submit the text in that tab's box. The current tab is never touched.
 static void SubmitInNewTab() {
+    if (open_tabs::Submit()) return;
     auto q = FocusedQueryBox().try_as<muxc::RichEditBox>();
     if (!q) return;
     winrt::hstring raw;
@@ -3088,7 +3099,10 @@ static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     try {
         if (msg == WM_ARC_CTRL_T) StartNewTabMode();
         else if (msg == WM_ARC_ENTER) SubmitInNewTab();
+    } catch (winrt::hresult_error const& e) {
+        Log("floating bar: action failed 0x%08lx", (unsigned long)e.code());
     } catch (...) {
+        Log("floating bar: action failed");
     }
     return DefWindowProcW(h, msg, wp, lp);
 }
@@ -3107,6 +3121,21 @@ static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
         if (Engine_TweakOn(L"floatingNewTab") && DiaIsForeground()) {
             bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
                  shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
+            // A newer address/new-tab command supersedes the deferred tab switch.
+            if (ctrl && !alt && !shift && (k->vkCode == 'L' || k->vkCode == 'T'))
+                open_tabs::CancelPendingActivation();
+            if (t_newTabMode && FocusedQueryBox()) {
+                try {
+                    if (!ctrl && !alt && !shift && (k->vkCode == VK_UP || k->vkCode == VK_DOWN) &&
+                        open_tabs::Arrow((WORD)k->vkCode)) return 1;
+                    if (k->vkCode != VK_UP && k->vkCode != VK_DOWN && k->vkCode != VK_RETURN &&
+                        k->vkCode != VK_CONTROL && k->vkCode != VK_SHIFT && k->vkCode != VK_MENU)
+                        open_tabs::Edit();
+                } catch (winrt::hresult_error const& e) {
+                    Log("open tabs: navigation failed 0x%08lx", (unsigned long)e.code());
+                    return 1;
+                }
+            }
             if (k->vkCode == 'T' && ctrl && !alt && !shift && t_passCtrlT) {
                 t_passCtrlT = false;  // our own new-tab request: Dia handles this one
             } else if (k->vkCode == 'T' && ctrl && !alt && !shift) {
@@ -3777,6 +3806,7 @@ bool Ui_Tick() {
             if (!Engine_TweakOn(L"arcUrlBar")) HookCommandBarPopovers();  // (Arc mode hooks them already)
         }
         UpdateNewTabMode();
+        open_tabs::Update();
         UpdateHoverCards();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
