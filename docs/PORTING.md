@@ -5,10 +5,12 @@ unofficial UI tweaks for the Dia browser. Nothing in Dia's install folder is mod
 
 Target: `TheBrowserCompany.Dia` 1.5.0.588, x64, packaged (MSIX), Swift + WinUI 3.
 
+The opt-in `localBrowsing` fallback discovers and validates native capabilities in each installed image. See [COMPATIBILITY.md](COMPATIBILITY.md) for the update policy and [LOCAL-BROWSING.md](LOCAL-BROWSING.md) for its behavior and checks.
+
 ## Use
 
 Open Dia through `bin\diatweaks.exe`, then **Dia → Settings → Patches**: every tweak has a switch there
-(plus a drop-down or text box where it has an option). Changes apply instantly and are saved to `bin\tweaks.conf`.
+(plus a drop-down or text box where it has an option). Appearance changes apply instantly and are saved to `bin\tweaks.conf`; the forced sign-in bypass requires a restart.
 
 The command line does the same:
 
@@ -90,15 +92,18 @@ Verified in Dia on this machine with screenshots (on, then off again, unless not
 | Allow iCloud passkeys / iCloud Passwords / 1Password | — | macOS-only. |
 | Group Tabs by Domain (command) | — | Not done: Dia exposes no way to reorder tabs other than dragging them. |
 
-The macOS Settings → Patches page is ported (switches, options, turn all off, safe mode). Not ported:
-in-app Software Update / auto-update and Restore (DiaTweaks for Windows never patches Dia, so there is
-nothing to restore — turn all off or delete the folder).
+The macOS Settings → Patches page is ported (switches, options, appearance presets and safe mode).
+The Windows implementation also has its own Updates page. It never modifies Dia's installed files;
+turn appearance tweaks off to restore their values, or disable local browsing and restart to remove
+its process-local changes.
 
 ## Files
 
 - `src/tap.cpp` — tree tracking, rule engine, config, safe mode. `src/engine.h` — API shared with ui.cpp.
 - `src/ui.cpp` — Settings → Patches page, window states, code-driven tweaks, `probe`.
 - `src/diatweaks.cpp` — the command.
+- `src/local_browsing.cpp` — guarded native startup and the process-local patch transaction.
+- `src/dia_native_layout.cpp` — read-only PE/Swift capability discovery, without a version allowlist.
 - `src/dia-load.cpp`, `src/test_attach.cpp`, `src/launch_direct.cpp` — earlier experiments, not needed.
 - `build.cmd`, `gen-winrt.cmd`, `reload.ps1` (close Dia, rebuild, restart with tweaks).
 - `tweaks.conf` — tweak definitions (copied to `bin\` on first build; `bin\tweaks.conf` is the live one).

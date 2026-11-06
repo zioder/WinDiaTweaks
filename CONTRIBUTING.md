@@ -18,6 +18,8 @@ Thanks for helping out. The short version: small changes, checked by hand in Dia
 | `src/tap.cpp` | The engine inside Dia: tracks Dia's UI tree, applies the rules, puts Dia's values back |
 | `src/ui.cpp` | Settings → Patches, and the tweaks that need real code (Arc URL bar, toolbar slide, ...) |
 | `src/diatweaks.cpp` | The `diatweaks` command: opens Dia, loads the add-on, edits `tweaks.conf` |
+| `src/local_browsing.cpp` | Opt-in native startup fallback and reversible process-local changes |
+| `src/dia_native_layout.cpp` | PE/Swift capability resolver; see [Compatibility](docs/COMPATIBILITY.md) |
 | `src/engine.h` | What `tap.cpp` and `ui.cpp` share |
 | `gen-winrt.cmd` | Makes C++/WinRT headers from the WinUI metadata in your Dia install (or NuGet without Dia) |
 | `.github/workflows/release.yml` | Builds and publishes a release when a `v*` tag is pushed |
@@ -59,7 +61,9 @@ Versions follow [SemVer](https://semver.org): new tweaks bump the minor version,
 
 ## Testing
 
-There are no automated tests yet. Before a PR, check by hand:
+Native fallback changes must pass `tests\local_browsing_native.cmd`, `tests\dia_native_layout_native.cmd`, and `tests\local_browsing_config.ps1` after building. These test owned child processes, malformed images and an isolated config; they do not use your browser data. The capability test also accepts local `Dia.dll` paths for supported-image and mutation checks. Do not commit those images.
+
+Before a PR, check appearance changes by hand:
 
 - The tweak on, off, and on again without restarting Dia. With it off, Dia must look exactly as it did before.
 - **Preset → Arc** and **Preset → None** with your tweak in the mix.
@@ -67,6 +71,8 @@ There are no automated tests yet. Before a PR, check by hand:
 - `diatweaks restart`: the tweak applies cleanly as Dia starts.
 
 `bin\tap.log` records what the engine did.
+
+The forced sign-in bypass requires a restart when changed. Its manual acceptance checks and the distinction between image inspection and runtime verification are in [LOCAL-BROWSING.md](docs/LOCAL-BROWSING.md).
 
 ## Commit messages
 

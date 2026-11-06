@@ -30,6 +30,7 @@
 #include <winrt/Windows.Web.Http.Headers.h>
 
 #include "shared.h"
+#include "local_browsing.h"
 #include "version.h"  // bin\version.h, written by build.cmd
 #ifndef WDT_VERSION
 #define WDT_VERSION L"dev"
@@ -309,7 +310,8 @@ static bool LaunchTweaked(DWORD* pid) {
     std::wstring cwd = exe.substr(0, exe.find_last_of(L'\\'));
     STARTUPINFOW si{sizeof(si)};
     PROCESS_INFORMATION pi{};
-    std::vector<wchar_t> buf(exe.begin(), exe.end());
+    std::wstring command = L"\"" + exe + L"\"";
+    std::vector<wchar_t> buf(command.begin(), command.end());
     buf.push_back(0);
     BOOL ok = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, FALSE, 0, nullptr, cwd.c_str(),
                              &si, &pi);
@@ -422,9 +424,13 @@ static int SetTweak(const std::wstring& which, bool on) {
     auto tweaks = ParseTweaks(lines);
     std::wstring w = Lower(which);
     bool hit = false;
+    bool startupChanged = false;
     for (auto& t : tweaks) {
         if (w != L"all" && Lower(t.key) != w && Lower(t.title) != w) continue;
         if (w == L"all" && t.key == L"normalLaunch") continue;  // a setting, not a patch
+        // The sign-in bypass is an explicit opt-in, independent of visual patches.
+        if (w == L"all" && on && t.key == L"localBrowsing") continue;
+        if (t.key == L"localBrowsing" && t.on != on) startupChanged = true;
         lines[t.line] = "[" + N(t.key) + "] " + (on ? "on" : "off");
         wprintf(L"%ls %ls\n", on ? L"Enabled " : L"Disabled", t.key.c_str());
         hit = true;
@@ -434,19 +440,22 @@ static int SetTweak(const std::wstring& which, bool on) {
         return 1;
     }
     std::ofstream out(g_dir + L"\\tweaks.conf", std::ios::binary);
+    if (!out) return fwprintf(stderr, L"Could not write tweaks.conf.\n"), 1;
     for (auto& l : lines) out << l << "\n";
     out.close();
+    if (!out) return fwprintf(stderr, L"Could not save tweaks.conf.\n"), 1;
     Signal(DT_EVENT_RELOAD);
+    if (startupChanged) wprintf(L"Restart Dia to apply the forced sign-in bypass: diatweaks restart\n");
     return 0;
 }
 
 // ---------------------------------------------------------------- launching
 
-static DWORD WaitForTap(int seconds) {
+static DWORD WaitForTap(int seconds, DWORD expectedPid) {
     // Polled often: the launcher raises Dia's window as soon as this returns.
     for (ULONGLONG end = GetTickCount64() + seconds * 1000ull; GetTickCount64() < end;) {
-        DWORD p = FindDiaUiPid();
-        if (p && TapAttached(p)) return p;
+        DWORD p = expectedPid ? expectedPid : FindDiaUiPid();
+        if (p && TapAttached(p) && (!expectedPid || DiaWindow(p))) return p;
         Sleep(20);
     }
     return 0;
@@ -475,18 +484,68 @@ static void CloseDia() {
 
 // ---------------------------------------------------------------- commands
 
+static const wchar_t kLaunchMutex[] = L"Local\\WinDiaTweaks_Launch";
+
+static bool ExplicitLaunchInProgress() {
+    HANDLE launch = OpenMutexW(SYNCHRONIZE, FALSE, kLaunchMutex);
+    if (!launch) return false;
+    CloseHandle(launch);
+    return true;
+}
+
 // Start a tweaked Dia, closing any plain instance first. Returns the tapped pid (0 on failure).
 static DWORD StartTweaked(bool quiet) {
+    struct LaunchLock {
+        HANDLE handle = CreateMutexW(nullptr, FALSE, kLaunchMutex);
+        bool owned = false;
+        LaunchLock() {
+            if (handle) {
+                DWORD wait = WaitForSingleObject(handle, 0);
+                owned = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+            }
+        }
+        ~LaunchLock() { if (owned) ReleaseMutex(handle); if (handle) CloseHandle(handle); }
+    } launch;
+    if (!launch.owned) {
+        fwprintf(stderr, L"Another Dia launch is in progress. Wait for it to finish.\n");
+        return 0;
+    }
+    bool localBrowsing = false;
+    for (auto& t : ParseTweaks(ReadLines()))
+        if (t.key == L"localBrowsing") localBrowsing = t.on;
+    int quickExits = 0;
+    { std::ifstream state(g_dir + L"\\launch.state"); state >> quickExits; }
+    if (localBrowsing && quickExits >= 2) {
+        fwprintf(stderr, L"Safe mode: the forced sign-in bypass is skipped with the other tweaks.\n");
+        localBrowsing = false;
+    }
+    std::wstring localExe;
+    if (localBrowsing) {
+        localExe = DiaExePath();
+        std::wstring message;
+        if (!local_browsing::CheckSupported(localExe, message)) {
+            fwprintf(stderr, L"Forced sign-in bypass could not start: %ls\n", message.c_str());
+            return 0;
+        }
+    }
     CloseDia();
     DWORD pid = 0;
-    if (!LaunchTweaked(&pid)) return 0;
-
-    // Attach right as Dia's main process starts, not once its window shows: the add-on then waits for
-    // WinUI inside Dia and the tweaks are in place before the first frame, so plain Dia never flashes.
-    if (pid && FindDiaMainPid() != pid) pid = 0;
-    for (ULONGLONG end = GetTickCount64() + 40000; !pid && GetTickCount64() < end;) {
-        pid = FindDiaMainPid();
-        if (!pid) Sleep(10);
+    if (localBrowsing) {
+        auto result = local_browsing::Launch(localExe);
+        if (result.status != local_browsing::LaunchStatus::Started) {
+            fwprintf(stderr, L"Forced sign-in bypass could not start: %ls\n", result.message.c_str());
+            return 0;
+        }
+        pid = result.pid;
+        if (!quiet) wprintf(L"Forced sign-in bypass enabled for this Dia process.\n");
+    } else {
+        if (!LaunchTweaked(&pid)) return 0;
+        // Attach as soon as Dia's main process starts. The add-on waits for WinUI inside Dia.
+        if (pid && FindDiaMainPid() != pid) pid = 0;
+        for (ULONGLONG end = GetTickCount64() + 40000; !pid && GetTickCount64() < end;) {
+            pid = FindDiaMainPid();
+            if (!pid) Sleep(10);
+        }
     }
     if (!pid) {
         fwprintf(stderr, L"Dia didn't come up. Try opening Dia yourself, then run: diatweaks\n");
@@ -494,7 +553,7 @@ static DWORD StartTweaked(bool quiet) {
     }
     if (!InjectTap(pid)) return 0;
 
-    pid = WaitForTap(30);
+    pid = WaitForTap(30, localBrowsing ? pid : 0);
     if (!pid) {
         fwprintf(stderr, L"Dia started but tweaks didn't load. See %ls\\tap.log\n", g_dir.c_str());
         return 0;
@@ -522,6 +581,8 @@ static int CmdApply() {
 static int CmdAttach() {
     DWORD pid = FindDiaMainPid();
     if (!pid) return 2;
+    if (ExplicitLaunchInProgress())
+        return fwprintf(stderr, L"Another Dia launch is in progress. Wait for it to finish.\n"), 1;
     if (!EnsureTweaked(pid, 15)) return 1;
     wprintf(L"Tweaks attached to running Dia (pid %lu)\n", pid);
     return 0;
@@ -1238,6 +1299,8 @@ static int CmdOpen() {
         }
         return 0;
     }
+    if (ExplicitLaunchInProgress())
+        return fwprintf(stderr, L"Another Dia launch is in progress. Wait for it to finish.\n"), 1;
     bool tweaked = EnsureTweaked(pid, 15);
     if (!ActivateDia() && !OpenDiaViaShell()) {  // still show Dia, even when the tweaks failed
         fwprintf(stderr, L"Couldn't bring Dia to the front.\n");
@@ -1377,6 +1440,8 @@ static int CmdWatch() {
         }
         ULONGLONG started = ProcessStartTime(pid);
         if (pid == handled && started == handledStart) continue;
+        // An explicit launch attaches on its own, after the startup debugger has detached if used.
+        if (ExplicitLaunchInProgress()) continue;
         handled = pid, handledStart = started;  // one go per Dia: it retries inside, and a failure shouldn't loop
         if (EnsureTweaked(pid, 40)) WatchLog(L"tweaks attached to Dia (pid %lu)", pid);
         else WatchLog(L"tweaks didn't attach to Dia (pid %lu), see tap.log", pid);
@@ -1510,7 +1575,7 @@ static void Usage() {
         L"  diatweaks update [what]   install updates: dia, tweaks, or both (the default)\n"
         L"  diatweaks version         show this WinDiaTweaks version\n\n"
         L"Every tweak can also be switched in Dia: Settings > Patches.\n"
-        L"Tweaks that are on apply the moment Dia starts, and live-reload on enable/disable.\n");
+        L"Visual tweaks reload instantly. The forced sign-in bypass requires a restart.\n");
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -1549,7 +1614,10 @@ int wmain(int argc, wchar_t** argv) {
     if (cmd == L"auto") return CmdAuto(argc > 2 ? Lower(argv[2]) : L"status");
     if (cmd == L"sync-helper") return SyncWatcher(true) ? 0 : 1;
     if (cmd == L"stop-helper") return StopWatcher(), 0;
-    if (cmd == L"launch" || cmd == L"restart") return StartTweaked(false) ? 0 : 1;
+    if (cmd == L"launch" || cmd == L"restart") {
+        int result = StartTweaked(false) ? 0 : 1;
+        return cmd == L"restart" ? Finish(result) : result;
+    }
     if (cmd == L"open") return CmdOpen();
     if (cmd == L"shortcuts") return CreateShortcuts(g_dir, !(argc > 2 && Lower(argv[2]) == L"--update")) ? 0 : 1;
     if (cmd == L"list") return ListTweaks(), 0;

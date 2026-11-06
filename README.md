@@ -12,16 +12,18 @@ Inspired by [DiaTweaks](https://github.com/JaceThings/DiaTweaks) for macOS by [J
 
 ## Tweaks
 
-Every tweak targets a single detail of Dia's interface: the margin around web pages, a toolbar button, the window background. Switch them in **Dia → Settings → Patches** or from the `diatweaks` command; Dia updates instantly, no restart needed.
+Switch tweaks in **Dia → Settings → Patches** or from the `diatweaks` command. Appearance changes apply instantly. The experimental forced sign-in bypass applies when Dia restarts.
 
-At the top of **Patches**, **Preset** sets everything at once:
+At the top of **Patches**, **Preset** sets the appearance tweaks at once, keeping your browsing, launch and update settings:
 
-- **None**: Dia as it comes (the default).
+- **None**: Dia's original appearance (the default).
 - **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
 | Tweak | Does |
 |---|---|
+| **Browser** | |
+| Bypass forced sign-in (experimental) ✨ | Opens ordinary browser windows without completing Dia sign-in. Requires a restart and compatible native capabilities; see below |
 | **Page** | |
 | Edge-to-edge web content | Removes the gap between pages and the window edge |
 | Square corners by the sidebar | Pages meet the sidebar and window edges with straight corners |
@@ -49,6 +51,23 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Window material | Mica, Mica Alt or Acrylic behind the tabs and sidebar |
 
 ✨ New in WinDiaTweaks, not in the macOS original. How each one is done on Windows: [docs/PORTING.md](docs/PORTING.md).
+
+### Bypassing forced sign-in
+
+**Bypass forced sign-in (experimental)** lets you use ordinary tabs without completing Dia's required sign-in. This includes the case where a region or account restriction sends Dia back to Welcome. The launcher discovers and checks the required native capabilities in your installed Dia. Missing or ambiguous capabilities produce an error before an existing browser is closed. Compatibility is not restricted to a version or file hash; see the [compatibility policy](docs/COMPATIBILITY.md).
+
+Enable it under **Settings → Patches → Browser**, then choose **Restart Dia**. If Welcome prevents you from reaching Settings, run these commands from this checkout:
+
+```powershell
+.\bin\diatweaks.exe enable localBrowsing
+.\bin\diatweaks.exe restart
+```
+
+AI, sync and account services retain their actual availability. The setting restores local actions such as Settings, imports, and new or incognito windows, while keeping their usual browser and policy checks. Automatic account-session revocation offers Dia's existing **Sign Out / Not Now** choice; **Not Now** keeps browsing open. Manual sign-out keeps its normal behavior.
+
+This setting is off by default and is kept when you change appearance presets. `enable all` leaves it unchanged; enable it by name. To remove it, run `diatweaks disable localBrowsing`, then restart. The changes exist only in the running process; Dia's installed files and account credentials are not edited. Technical details and verification steps are in [docs/LOCAL-BROWSING.md](docs/LOCAL-BROWSING.md).
+
+For future starts, use **Dia (Tweaks)** when Dia is fully closed. **Patch Dia however it's opened** can add appearance tweaks to an ordinary launch, but the sign-in bypass needs the tweaked launcher to start the process.
 
 ## Install
 
@@ -139,6 +158,8 @@ You can name a tweak by its key (`hideToolbar`) or by the title shown in Setting
 
 Or from PowerShell: `diatweaks check` to see what's new, `diatweaks update` to install it (`diatweaks update dia` or `diatweaks update tweaks` for one of them).
 
+Dia updates keep your choices. The local browsing fallback checks the updated image on its next launch; a change to a required native capability can require a WinDiaTweaks update. See [Compatibility](docs/COMPATIBILITY.md).
+
 ### Installed before v1.0.0?
 
 Versions before v1.0.0 don't have **Updates** yet, so update once by hand. In PowerShell:
@@ -156,14 +177,14 @@ Building it yourself, if the build complains after Dia updates, delete the `gen`
 <details>
 <summary><strong>Is it safe?</strong></summary>
 
-Releases are built by [GitHub Actions](.github/workflows/release.yml) from the code in this repo, and you can compile it yourself instead, so you can see everything it does. It only rearranges and restyles Dia's interface; it has no access to what you browse, your history or your saved passwords. Your choices live in one plain text file, `bin\tweaks.conf`.
+Releases are built by [GitHub Actions](.github/workflows/release.yml) from the code in this repo, and you can compile it yourself instead. Appearance tweaks rearrange and restyle Dia's interface. The optional forced sign-in bypass also changes native startup and local-command checks in memory, after capability and runtime checks. It does not load or edit account credentials. Your choices live in one plain text file, `bin\tweaks.conf`.
 
 </details>
 
 <details>
 <summary><strong>How does it work?</strong></summary>
 
-Nothing in Dia's install folder is changed. `diatweaks.exe` opens Dia and loads a small add-on into it. The add-on uses WinUI's XAML diagnostics interface, the same one Visual Studio's Live Visual Tree uses, to move, hide and restyle parts of Dia while it runs. Turning a tweak off puts Dia's own values back.
+Nothing in Dia's install folder is changed. `diatweaks.exe` opens Dia and loads a small add-on into it. The add-on uses WinUI's XAML diagnostics interface, the same one Visual Studio's Live Visual Tree uses, to move, hide and restyle parts of Dia while it runs. Turning an appearance tweak off puts Dia's own values back. The forced sign-in bypass uses an early native startup hook and requires a restart when switched on or off.
 
 </details>
 

@@ -9,7 +9,7 @@
 <!-- Windows version, Dia version -->
 
 ## Checklist
-- [ ] Works with the tweak on, off, and on again without restarting Dia
+- [ ] Works with the tweak on, off, and on again (restart only for settings that require it)
 - [ ] Dia looks exactly as before with the tweak off
 - [ ] Checked with Preset → Arc and Preset → None
 - [ ] Checked with the sidebar docked, closed and floating, in split view and on the New Tab page

@@ -1010,7 +1010,7 @@ void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value
     SetInLines(lines, key, &on, value);
     // Changing one patch by hand leaves the preset: it becomes Custom.
     static const std::wstring custom = L"custom";
-    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch")
+    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch" && key != L"localBrowsing")
         SetInLines(lines, L"preset", nullptr, &custom);
     WriteConfLines(lines);
     ApplyConfigNow();
@@ -1030,7 +1030,7 @@ void Engine_SetAll(bool on) {
     auto lines = ReadConfLines();
     for (auto& l : lines) {
         std::string k;
-        if (IsHeader(l, &k)) l = "[" + k + "] " + (on ? "on" : "off");
+        if (IsHeader(l, &k) && !(on && k == "localBrowsing")) l = "[" + k + "] " + (on ? "on" : "off");
     }
     WriteConfLines(lines);
     ApplyConfigNow();

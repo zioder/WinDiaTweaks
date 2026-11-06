@@ -34,6 +34,18 @@ jobs:
           set "WDT_VERSION=%TAG%"
           call build.cmd
 
+      - name: Test native browsing fallback
+        shell: cmd
+        run: call tests\local_browsing_native.cmd
+
+      - name: Test native capability resolver
+        shell: cmd
+        run: call tests\dia_native_layout_native.cmd
+
+      - name: Test browsing configuration
+        shell: pwsh
+        run: ./tests/local_browsing_config.ps1
+
       - name: Package
         shell: pwsh
         run: |
