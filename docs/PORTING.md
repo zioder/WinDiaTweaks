@@ -45,8 +45,8 @@ diagnostics API. From there:
 - **Hidden toolbar** (and the three "show toolbar" tweaks) is done in code: a watcher thread checks the
   pointer every 8 ms and pings Dia's UI thread at once. Showing/hiding slides the toolbar *and the web page*
   together each frame (ease-out, 200 ms). While sliding, the page keeps its size, so Dia only moves its
-  web-content window; the page is resized once, at the end of a reveal or the start of a hide. This is the
-  sliding, not reflowing every frame. Measured: ~20 positions per slide,
+  web-content window; the page is resized once, at the end of a reveal or the start of a hide. So the page
+  slides instead of reflowing every frame. Measured: ~20 positions per slide,
   first movement ~10-25 ms after the pointer reaches the top. Typing in the address bar (Ctrl+L) also keeps
   the toolbar out.
 - With the toolbar hidden (Hide toolbar / Arc URL bar), Dia's invisible window-drag strip over the old toolbar

@@ -1008,9 +1008,16 @@ static void StartWatcher() {
 void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value) {
     auto lines = ReadConfLines();
     SetInLines(lines, key, &on, value);
-    // Changing one patch by hand leaves the preset: it becomes Custom.
+    // Changing one patch by hand leaves the preset: it becomes Custom. (Not for an option of
+    // another tweak, "switch: none".)
     static const std::wstring custom = L"custom";
-    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch")
+    bool option = false;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_mx);
+        for (auto& t : g_tweaks)
+            if (t.key == key) option = t.noSwitch;
+    }
+    if (key != L"preset" && key != L"checkForUpdates" && key != L"normalLaunch" && !option)
         SetInLines(lines, L"preset", nullptr, &custom);
     WriteConfLines(lines);
     ApplyConfigNow();

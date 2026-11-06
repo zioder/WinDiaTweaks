@@ -2339,6 +2339,7 @@ void MoveTick() {
                 in.mi.dwExtraInfo = kReplayTag;
                 return in;
             };
+            Ui_PeekCloseTabMenu(g_move.dia);  // (an old menu open would be the one "Open as split" is chosen in)
             HidePopups(true);
             INPUT in[4] = {abs(at, 0), abs(at, MOUSEEVENTF_RIGHTDOWN), abs(at, MOUSEEVENTF_RIGHTUP), abs(back, 0)};
             SendInput(4, in, sizeof(INPUT));
