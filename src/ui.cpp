@@ -6607,6 +6607,15 @@ static mux::FrameworkElement PeekTabList(HWND window) {
     return nullptr;
 }
 
+// Dia's menu labels, compared ignoring case: Dia 1.6 writes "Move to window" and "New window" where 1.5
+// wrote "Move to Window" and "New Window".
+static bool StartsWithNoCase(std::wstring_view s, std::wstring_view prefix) {
+    return s.size() >= prefix.size() && _wcsnicmp(s.data(), prefix.data(), prefix.size()) == 0;
+}
+static bool EndsWithNoCase(std::wstring_view s, std::wstring_view suffix) {
+    return s.size() >= suffix.size() && _wcsnicmp(s.data() + s.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
+}
+
 static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
     wchar_t title[512]{};
     GetWindowTextW(window, title, ARRAYSIZE(title));
@@ -6685,7 +6694,7 @@ int Ui_PeekSplitWith(HWND win, const std::wstring& title) {
             if (!child) continue;
             auto item = FirstIn(child, [](const mux::FrameworkElement& fe) {
                 auto mi = fe.try_as<muxc::MenuFlyoutItem>();
-                return mi && std::wstring_view(mi.Text()).starts_with(L"Open as split");
+                return mi && StartsWithNoCase(mi.Text(), L"Open as split");
             });
             if (!item) continue;
             auto mi = item.as<muxc::MenuFlyoutItem>();
@@ -6746,7 +6755,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
             if (!child) continue;
             auto element = FirstIn(child, [](const mux::FrameworkElement& fe) {
                 auto sub = fe.try_as<muxc::MenuFlyoutSubItem>();
-                return sub && std::wstring_view(sub.Text()).starts_with(L"Move to Window");
+                return sub && StartsWithNoCase(sub.Text(), L"Move to Window");
             });
             if (!element) continue;
             auto sub = element.as<muxc::MenuFlyoutSubItem>();
@@ -6782,7 +6791,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
             std::vector<muxc::MenuFlyoutItem> destinations;
             for (auto const& item : sub.Items()) {
                 auto candidate = item.try_as<muxc::MenuFlyoutItem>();
-                if (candidate && candidate.Text() != L"New Window") destinations.push_back(candidate);
+                if (candidate && _wcsicmp(candidate.Text().c_str(), L"New Window") != 0) destinations.push_back(candidate);
             }
             for (auto const& d : destinations)
                 Log("peek: Move to Window item '%ls'%s", d.Text().c_str(), d.IsEnabled() ? "" : " (disabled)");
@@ -6793,7 +6802,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
                 // The source window holds only the preview's tab. When yours holds one tab too, the labels
                 // can't tell them apart: Dia lists the window last active (the preview's) first.
                 auto singleTab = [](const muxc::MenuFlyoutItem& item) {
-                    return std::wstring_view(item.Text()).ends_with(L" & 1 Tab");
+                    return EndsWithNoCase(item.Text(), L" & 1 Tab");
                 };
                 bool firstIsSource = singleTab(destinations[0]), secondIsSource = singleTab(destinations[1]);
                 if (firstIsSource == secondIsSource) firstIsSource = true;

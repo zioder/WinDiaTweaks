@@ -1401,11 +1401,18 @@ LRESULT CALLBACK ButtonProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_LBUTTONDOWN:
-        if (i >= 0) G.pressed = i, DrawButton(i, G.hoverScale[i], 1);
+        // (The release comes here even if the pointer is off the button by then: the button redraws
+        // itself pressed, and a layered window being redrawn can let the release fall through to the
+        // window under it.)
+        if (i >= 0) G.pressed = i, SetCapture(h), DrawButton(i, G.hoverScale[i], 1);
         return 0;
     case WM_LBUTTONUP:
+        if (GetCapture() == h) ReleaseCapture();
         if (i >= 0) {
-            bool hit = G.pressed == i;
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            RECT cr;
+            GetClientRect(h, &cr);
+            bool hit = G.pressed == i && PtInRect(&cr, pt);  // (released on it: let go elsewhere, nothing)
             G.pressed = -1;
             if (hit && G.phase == gOpen) PostMessageW(g_msg, WM_PEEK_DISMISS, i, 0);  // (0 close, 1 tab, 2 split)
         }
