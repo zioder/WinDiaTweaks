@@ -28,6 +28,10 @@ jobs:
           ref: ${{ env.TAG }}
           fetch-depth: 0
 
+      - name: Test media state
+        shell: cmd
+        run: call build.cmd test-media
+
       - name: Build
         shell: cmd
         run: |

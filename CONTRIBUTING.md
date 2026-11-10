@@ -60,7 +60,11 @@ Versions follow [SemVer](https://semver.org): new tweaks bump the minor version,
 
 ## Testing
 
-There are no automated tests yet. Before a PR, check by hand:
+Run `build.cmd test-media` for the media worker's shared-state regression tests (no Dia or WinUI metadata
+needed). The release workflow runs them before building. See [Now Playing stability](docs/NOW_PLAYING_STABILITY.md)
+for the local playback fixture and the remaining UI checks.
+
+Before a PR, also check by hand:
 
 - The tweak on, off, and on again without restarting Dia. With it off, Dia must look exactly as it did before.
 - **Preset → Arc** and **Preset → None** with your tweak in the mix.

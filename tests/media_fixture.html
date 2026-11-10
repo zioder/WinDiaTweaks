@@ -1,0 +1,55 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Now Playing stability fixture</title>
+<style>
+body { font: 18px system-ui; max-width: 720px; margin: 60px auto; padding: 24px; background: #16191d; color: #eee; }
+button { padding: 12px 18px; margin: 8px; font: inherit; }
+audio { display: block; margin: 24px 0; width: 100%; }
+</style>
+<h1>Now Playing stability fixture</h1>
+<p>A quiet generated tone with local artwork and Media Session controls. No network media or account is used.</p>
+<audio id="audio" controls loop></audio>
+<button id="next">Next song</button><button id="rapid">Change song 20 times</button>
+<p id="status">Ready</p>
+<script>
+const audio = document.querySelector('audio');
+const rate = 16000, count = rate * 30;
+const wav = new ArrayBuffer(44 + count * 2), view = new DataView(wav);
+const word = (at, s) => [...s].forEach((ch, i) => view.setUint8(at + i, ch.charCodeAt(0)));
+word(0, 'RIFF'); view.setUint32(4, 36 + count * 2, true); word(8, 'WAVE'); word(12, 'fmt ');
+view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true);
+view.setUint16(34, 16, true); word(36, 'data'); view.setUint32(40, count * 2, true);
+for (let i = 0; i < count; ++i) view.setInt16(44 + i * 2, Math.sin(i * 2 * Math.PI * 220 / rate) * 300, true);
+audio.src = URL.createObjectURL(new Blob([wav], { type: 'audio/wav' }));
+let song = 0;
+function update() {
+  ++song;
+  const title = `Stability song ${song}`;
+  document.title = `${title} - Now Playing fixture`;
+  const canvas = document.createElement('canvas'); canvas.width = canvas.height = 128;
+  const ctx = canvas.getContext('2d'); ctx.fillStyle = `hsl(${song * 73 % 360} 50% 35%)`; ctx.fillRect(0, 0, 128, 128);
+  ctx.fillStyle = 'white'; ctx.font = '48px system-ui'; ctx.fillText(String(song), 20, 80);
+  navigator.mediaSession.metadata = new MediaMetadata({title, artist: 'Local stability test',
+    album: 'WinDiaTweaks #52', artwork: [{src: canvas.toDataURL(), sizes: '128x128', type: 'image/png'}]});
+  document.querySelector('#status').textContent = title;
+}
+navigator.mediaSession.setActionHandler('play', () => audio.play());
+navigator.mediaSession.setActionHandler('pause', () => audio.pause());
+navigator.mediaSession.setActionHandler('nexttrack', update);
+navigator.mediaSession.setActionHandler('previoustrack', update);
+navigator.mediaSession.setActionHandler('seekto', e => { audio.currentTime = e.seekTime; position(); });
+function position() {
+  if (Number.isFinite(audio.duration)) navigator.mediaSession.setPositionState({
+    duration: audio.duration, playbackRate: audio.playbackRate, position: audio.currentTime});
+}
+audio.addEventListener('play', () => { navigator.mediaSession.playbackState = 'playing'; position(); });
+audio.addEventListener('pause', () => { navigator.mediaSession.playbackState = 'paused'; position(); });
+audio.addEventListener('seeked', position);
+audio.addEventListener('loadedmetadata', position);
+document.querySelector('#next').onclick = update;
+document.querySelector('#rapid').onclick = () => {
+  let remaining = 20; const timer = setInterval(() => { update(); if (!--remaining) clearInterval(timer); }, 100);
+};
+update();
+</script>

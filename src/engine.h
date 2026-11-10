@@ -41,6 +41,8 @@ struct NodeRef {
     std::wstring type, name;
 };
 void Engine_ForEachNode(const std::function<void(const NodeRef&)>& fn);
+// Changes when elements enter/leave the calling UI thread's tree (for weak discovery caches).
+unsigned long long Engine_TreeRevision();
 InstanceHandle Engine_Parent(InstanceHandle h);
 std::wstring Engine_Name(InstanceHandle h);
 std::wstring Engine_Type(InstanceHandle h);

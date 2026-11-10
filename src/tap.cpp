@@ -32,6 +32,7 @@
 // ---------------------------------------------------------------- utils
 
 static HMODULE g_module;
+static thread_local unsigned long long t_treeRevision = 0;
 static std::wstring g_dir;  // folder holding the DLL, tweaks.conf, logs
 
 static std::wstring Narrow2Wide(const std::string& s) {
@@ -871,6 +872,7 @@ public:
         std::lock_guard<std::recursive_mutex> lk(g_mx);
         EnsureTimerOnThisThread();
         if (mt == Add) {
+            ++t_treeRevision;
             Node& n = g_nodes[el.Handle];
             n.parent = rel.Parent;
             n.childIndex = rel.ChildIndex;
@@ -888,6 +890,7 @@ public:
             EvaluateSubtree(el.Handle);
             if (!name.empty()) Ui_ElementAdded(name);
         } else {
+            ++t_treeRevision;
             auto it = g_nodes.find(el.Handle);
             if (it != g_nodes.end()) {
                 auto p = g_nodes.find(it->second.parent);
@@ -1097,6 +1100,8 @@ void Engine_LeaveSafeMode() {
     Log("safe mode off");
     ApplyConfigNow();
 }
+
+unsigned long long Engine_TreeRevision() { return t_treeRevision; }
 
 void Engine_ForEachNode(const std::function<void(const NodeRef&)>& fn) {
     std::lock_guard<std::recursive_mutex> lk(g_mx);

@@ -27,6 +27,11 @@ set "LIB=%VC%\lib\x64;%SDK%\Lib\%SV%\ucrt\x64;%SDK%\Lib\%SV%\um\x64"
 if not exist bin mkdir bin
 > bin\version.h echo #define WDT_VERSION L"%VER%"
 set FLAGS=/nologo /utf-8 /std:c++20 /O2 /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SECURE_NO_WARNINGS /MT
+if /i "%~1"=="test-media" (
+    cl %FLAGS% tests\media_state_test.cpp /Fobin\ /Febin\media-state-test.exe || exit /b 1
+    bin\media-state-test.exe
+    exit /b
+)
 rem C++/WinRT headers for Dia's WinUI live in gen\ (made from Dia's own .winmd files by gen-winrt.cmd).
 if not exist gen\winrt\Microsoft.UI.Xaml.Controls.h call "%~dp0gen-winrt.cmd" || exit /b 1
 for /f "delims=" %%v in ('dir /b /ad /o-n "%ProgramFiles(x86)%\Windows Kits\10\Include\10.*" 2^>nul') do if not defined SDKV set "SDKV=%%v"
