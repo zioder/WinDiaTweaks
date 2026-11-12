@@ -60,6 +60,7 @@
 #include <endpointvolume.h>
 
 #include "engine.h"
+#include "media_state.h"
 
 namespace wf = winrt::Windows::Foundation;
 namespace wmc = winrt::Windows::Media::Control;
@@ -82,6 +83,8 @@ namespace {
 enum CmdKind { kToggle = 1, kNext, kPrev, kSeek };
 struct Cmd {
     CmdKind kind;
+    int session;
+    ULONGLONG at;
     double seconds = 0;  // kSeek: where to
 };
 
@@ -105,20 +108,39 @@ std::mutex g_mx;
 Smtc g_smtc;
 std::vector<Cmd> g_cmds;
 std::atomic<bool> g_want{false}, g_running{false};
-HANDLE g_wake = nullptr;
+std::atomic<int> g_sessionSequence{0};
+std::atomic<HANDLE> g_wake{nullptr};
 
 Smtc Snapshot() {
     std::lock_guard lk(g_mx);
     return g_smtc;
 }
 
-void Send(CmdKind kind, double seconds = 0) {
-    Cmd c{kind, seconds};
+void Send(CmdKind kind, int session, double seconds = 0) {
+    Cmd c{kind, session, GetTickCount64(), seconds};
     {
         std::lock_guard lk(g_mx);
+        if (!g_want) return;
+        // Dragging seeks can replace a queued seek; never let a stalled service grow an unbounded queue.
+        if (kind == kSeek && !g_cmds.empty() && g_cmds.back().kind == kSeek) g_cmds.pop_back();
+        if (g_cmds.size() >= 16) return;
         g_cmds.push_back(c);
     }
     if (g_wake) SetEvent(g_wake);
+}
+
+template <class T>
+auto Await(const T& op, const char* name) {
+    ULONGLONG start = GetTickCount64();
+    if (op.wait_for(std::chrono::seconds(2)) == wf::AsyncStatus::Started) {
+        Log("media: %s timed out (worker only)", name);
+        op.Cancel();
+        throw winrt::hresult_error(HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+    }
+    auto result = op.get();
+    ULONGLONG elapsed = GetTickCount64() - start;
+    if (elapsed >= 100) Log("media: slow %s %llu ms (worker only)", name, elapsed);
+    return result;
 }
 
 bool IsDia(const wmc::GlobalSystemMediaTransportControlsSession& s) {
@@ -126,11 +148,28 @@ bool IsDia(const wmc::GlobalSystemMediaTransportControlsSession& s) {
     return id.find(L"TheBrowserCompany.Dia") != std::wstring::npos;
 }
 
-void Worker() {
+void WorkerBody() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
     wmc::GlobalSystemMediaTransportControlsSessionManager mgr{nullptr};
     wmc::GlobalSystemMediaTransportControlsSession last{nullptr}, watched{nullptr};
-    winrt::event_token tokProps{}, tokInfo{}, tokTimeline{};
+    winrt::event_token tokSessions{}, tokProps{}, tokInfo{}, tokTimeline{};
+    auto unwatch = [&] {
+        if (watched) {
+            try { watched.MediaPropertiesChanged(tokProps); } catch (...) {}
+            try { watched.PlaybackInfoChanged(tokInfo); } catch (...) {}
+            try { watched.TimelinePropertiesChanged(tokTimeline); } catch (...) {}
+            watched = nullptr;
+        }
+    };
+    auto disconnect = [&] {
+        unwatch();
+        if (mgr) {
+            try { mgr.SessionsChanged(tokSessions); } catch (...) {}
+            mgr = nullptr;
+        }
+        last = nullptr;
+    };
     int session = 0;
     // A change in what plays wakes this thread at once (instead of at its next look, up to 0.4 s later).
     auto wake = [](auto&&, auto&&) {
@@ -150,9 +189,8 @@ void Worker() {
     while (g_want) {
         try {
             if (!mgr) {
-                mgr = wmc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync().get();
-                mgr.SessionsChanged(wake);
-                watched = nullptr;
+                mgr = Await(wmc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync(), "session manager");
+                tokSessions = mgr.SessionsChanged(wake);
             }
             // Dia's session: the one playing, else the one shown last (paused: it stays), else any of Dia's.
             wmc::GlobalSystemMediaTransportControlsSession pick{nullptr}, playing{nullptr};
@@ -170,16 +208,16 @@ void Worker() {
             else if (lastThere) pick = last;
             last = pick;
             if (pick != watched) {
-                try {
-                    if (watched) {
-                        watched.MediaPropertiesChanged(tokProps);
-                        watched.PlaybackInfoChanged(tokInfo);
-                        watched.TimelinePropertiesChanged(tokTimeline);
-                    }
-                } catch (...) {
-                }
+                unwatch();
                 watched = pick;
-                session++;
+                session = ++g_sessionSequence;
+                art = pendArt = nullptr;
+                artHash = pendHash = 0;
+                artFor.clear();
+                artOwner.clear();
+                artGen++;
+                artRead = 0;
+                artSince = GetTickCount64();
                 if (pick) {
                     tokProps = pick.MediaPropertiesChanged(wake);
                     tokInfo = pick.PlaybackInfoChanged(wake);
@@ -193,16 +231,17 @@ void Worker() {
             }
             for (Cmd c : cmds) {
                 if (!pick) break;
-                bool ok = c.kind == kToggle ? pick.TryTogglePlayPauseAsync().get()
-                        : c.kind == kNext   ? pick.TrySkipNextAsync().get()
-                        : c.kind == kPrev   ? pick.TrySkipPreviousAsync().get()
-                                            : pick.TryChangePlaybackPositionAsync((int64_t)(c.seconds * 1e7)).get();
+                if (!g_want || c.session != session || GetTickCount64() - c.at > 2000) continue;
+                bool ok = c.kind == kToggle ? Await(pick.TryTogglePlayPauseAsync(), "play/pause")
+                        : c.kind == kNext   ? Await(pick.TrySkipNextAsync(), "next")
+                        : c.kind == kPrev   ? Await(pick.TrySkipPreviousAsync(), "previous")
+                                            : Await(pick.TryChangePlaybackPositionAsync((int64_t)(c.seconds * 1e7)), "seek");
                 const char* what[] = {"", "play/pause", "next", "previous", "seek"};
                 Log("media: %s %s", what[c.kind], ok ? "sent" : "refused");
             }
             Smtc s;
             if (pick) {
-                auto props = pick.TryGetMediaPropertiesAsync().get();
+                auto props = Await(pick.TryGetMediaPropertiesAsync(), "metadata");
                 auto info = pick.GetPlaybackInfo();
                 auto ctl = info.Controls();
                 s.has = true;
@@ -247,13 +286,17 @@ void Worker() {
                     wss::IRandomAccessStream got{nullptr};
                     if (auto ref = props.Thumbnail()) {
                         try {
-                            auto in = ref.OpenReadAsync().get();
+                            auto in = Await(ref.OpenReadAsync(), "artwork open");
+                            if (in.Size() > 8 * 1024 * 1024) throw winrt::hresult_error(E_INVALIDARG);
                             wss::InMemoryRandomAccessStream mem;
-                            wss::RandomAccessStream::CopyAndCloseAsync(in.GetInputStreamAt(0), mem.GetOutputStreamAt(0)).get();
+                            // Bound the copy even if a provider reports an incorrect stream size.
+                            Await(wss::RandomAccessStream::CopyAsync(in.GetInputStreamAt(0), mem.GetOutputStreamAt(0),
+                                                                   8 * 1024 * 1024 + 1), "artwork copy");
+                            if (mem.Size() > 8 * 1024 * 1024) throw winrt::hresult_error(E_INVALIDARG);
                             uint32_t n = (uint32_t)mem.Size();
                             if (n) {
                                 wss::DataReader rd(mem.GetInputStreamAt(0));
-                                rd.LoadAsync(n).get();
+                                Await(rd.LoadAsync(n), "artwork read");
                                 std::vector<uint8_t> bytes(n);
                                 rd.ReadBytes(bytes);
                                 hash = std::hash<std::string_view>{}(std::string_view((const char*)bytes.data(), n));
@@ -286,6 +329,7 @@ void Worker() {
                         bool stale = std::find(recentHashes.begin(), recentHashes.end(), hash) != recentHashes.end();
                         if (hash == artHash) {
                             artTaken = true;  // (the same picture as showing: an album's cover, say)
+                            artOwner = artFor;
                         } else {
                             // A new picture has to stay a moment (0.35 s; one from the last songs 4 s) before
                             // it's taken. One replaced meanwhile, early in a song, was a stand-in.
@@ -309,13 +353,24 @@ void Worker() {
             }
         } catch (winrt::hresult_error const& e) {
             Log("media: system media controls 0x%08lx", (unsigned long)e.code());
-            mgr = nullptr;
+            disconnect();
             Sleep(1000);
         } catch (...) {
-            mgr = nullptr;
+            disconnect();
             Sleep(1000);
         }
         WaitForSingleObject(g_wake, GetTickCount64() - artSince < 5000 ? 250 : 400);
+    }
+    disconnect();
+}
+
+void Worker() noexcept {
+    try {
+        WorkerBody();
+    } catch (winrt::hresult_error const& e) {
+        Log("media: worker initialization 0x%08lx", (unsigned long)e.code());
+    } catch (...) {
+        Log("media: worker stopped after an exception");
     }
     {
         std::lock_guard lk(g_mx);
@@ -329,9 +384,13 @@ void RunWorker(bool on) {
     g_want = on;
     if (on && !g_running.exchange(true)) {
         if (!g_wake) g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        std::thread(Worker).detach();
+        if (!g_wake) { g_running = false; return; }
+        try { std::thread(Worker).detach(); }
+        catch (...) { g_running = false; Log("media: couldn't start metadata worker"); }
     } else if (!on && g_wake) {
         SetEvent(g_wake);
+        std::lock_guard lk(g_mx);
+        g_cmds.clear();
     }
 }
 
@@ -420,19 +479,39 @@ bool ReadRow(const muxc::UserControl& uc, Row& r) {
     return true;
 }
 
-std::vector<Row> RowsIn(const mux::FrameworkElement& paging, const mux::UIElement& skip) {
+struct RowCache {
+    std::vector<winrt::weak_ref<muxc::UserControl>> rows;
+    unsigned long long revision = ~0ull;
+    ULONGLONG scanned = 0;
+};
+
+std::vector<Row> RowsIn(const mux::FrameworkElement& paging, const mux::UIElement& skip, RowCache& cache) {
     std::vector<Row> out;
-    Walk(paging, [&](const mux::DependencyObject& d) {
-        if (skip && d == skip) return false;
-        if (auto uc = d.try_as<muxc::UserControl>()) {
-            Row r;
-            if (ReadRow(uc, r)) {
-                if (uc.ActualHeight() > 0) out.push_back(std::move(r));
-                return false;
+    auto now = GetTickCount64();
+    auto revision = Engine_TreeRevision();
+    if (cache.revision != revision || now - cache.scanned >= 2000) {
+        cache.rows.clear();
+        Walk(paging, [&](const mux::DependencyObject& d) {
+            if (skip && d == skip) return false;
+            if (auto uc = d.try_as<muxc::UserControl>()) {
+                auto grid = uc.Content().try_as<muxc::Grid>();
+                if (grid && grid.ColumnDefinitions().Size() == 5) {
+                    cache.rows.push_back(winrt::make_weak(uc));
+                    return false;
+                }
             }
-        }
-        return true;
-    });
+            return true;
+        });
+        cache.revision = revision;
+        cache.scanned = now;
+    }
+    // Sound, title, selection and favicon stay live; only discovery of the tab controls is cached.
+    for (auto& weak : cache.rows) {
+        auto uc = weak.get();
+        if (!uc || !uc.IsLoaded()) { cache.revision = ~0ull; continue; }
+        Row row;
+        if (uc.ActualHeight() > 0 && ReadRow(uc, row)) out.push_back(std::move(row));
+    }
     return out;
 }
 
@@ -556,8 +635,8 @@ Theme ThemeOf(const mux::FrameworkElement& el, Color profile) {
 muxm::SolidColorBrush Solid(Color c) { return muxm::SolidColorBrush(c); }
 
 void Put(const mux::UIElement& el, double x, double y) {
-    muxc::Canvas::SetLeft(el, x);
-    muxc::Canvas::SetTop(el, y);
+    if (muxc::Canvas::GetLeft(el) != x) muxc::Canvas::SetLeft(el, x);
+    if (muxc::Canvas::GetTop(el) != y) muxc::Canvas::SetTop(el, y);
 }
 
 // One line of text, trimmed with … when it doesn't fit. A new
@@ -700,7 +779,8 @@ struct IconBtn {
 };
 
 // Dia's sound level, for the equalizer. Windows keeps a peak meter for every app's audio session, so
-// nothing is captured or analysed: one cheap call reads it. Dia's tabs play through its audio service (a
+// nothing is captured or analysed. All audio interfaces belong to the background worker below; even a
+// peak read can wait on Windows' audio service. Dia's tabs play through its audio service (a
 // Dia.exe process of its own), so the sessions of any Dia.exe count; they're looked up again every 2 s.
 struct Meter {
     std::vector<winrt::com_ptr<IAudioMeterInformation>> meters;
@@ -723,8 +803,10 @@ struct Meter {
         return dia[pid] = yes;
     }
     void Refresh() {
+        ULONGLONG start = GetTickCount64();
         found = GetTickCount64();
         meters.clear();
+        dia.clear();  // process ids can be reused
         winrt::com_ptr<IMMDeviceEnumerator> en;
         winrt::com_ptr<IMMDeviceCollection> all;
         if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(en.put()))) ||
@@ -753,12 +835,14 @@ struct Meter {
         }
         static thread_local size_t logged = (size_t)-1;
         if (meters.size() != logged) logged = meters.size(), Log("media: %zu sound meter(s) of Dia's", logged);
+        auto elapsed = GetTickCount64() - start;
+        if (elapsed >= 100) Log("media: slow audio discovery %llu ms (worker only)", elapsed);
     }
     // The loudest of Dia's sessions now (0..1), or -1 when Dia has none.
     float Peak() {
         if (GetTickCount64() - found > 2000) Refresh();
         if (meters.empty()) return -1;
-        float best = 0;
+        float best = -1;
         for (auto& m : meters) {
             float v = 0;
             if (SUCCEEDED(m->GetPeakValue(&v)) && v > best) best = v;
@@ -767,16 +851,67 @@ struct Meter {
     }
 };
 
+media::PeakMailbox g_peak;
+HANDLE g_peakWake = nullptr;
+
+void MeterWorker() noexcept {
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
+        Meter meter;
+        ULONGLONG lastSlowLog = 0;
+        for (;;) {
+            if (!g_peak.Wanted(GetTickCount64())) {
+                meter.meters.clear();
+                meter.dia.clear();
+                meter.found = 0;
+                WaitForSingleObject(g_peakWake, INFINITE);
+                continue;
+            }
+            ULONGLONG start = GetTickCount64();
+            float peak = meter.Peak();
+            ULONGLONG end = GetTickCount64();
+            g_peak.Publish(peak, end);
+            if (end - start >= 100 && end - lastSlowLog >= 10000) {
+                lastSlowLog = end;
+                Log("media: slow audio sample %llu ms (worker only)", end - start);
+            }
+            Sleep(33);
+        }
+    } catch (...) {
+        // A failed worker leaves an unavailable/stale sample; the UI still animates without waiting.
+        Log("media: audio worker unavailable; using the equalizer fallback");
+    }
+}
+
+float ReadPeak() {
+    static std::once_flag once;
+    try {
+        std::call_once(once, [] {
+            g_peakWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!g_peakWake) throw winrt::hresult_error(HRESULT_FROM_WIN32(GetLastError()));
+            try { std::thread(MeterWorker).detach(); }
+            catch (...) { CloseHandle(g_peakWake); g_peakWake = nullptr; throw; }
+        });
+        auto now = GetTickCount64();
+        g_peak.Request(now);
+        SetEvent(g_peakWake);
+        return g_peak.Read(now);
+    } catch (...) {
+        return -1;
+    }
+}
+
 struct Equalizer;
 thread_local std::set<Equalizer*> t_eqs;  // equalizers bouncing now (on this thread)
 thread_local winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer t_eqTimer{nullptr};
-thread_local Meter t_meter;
 void EqTick();
 
 // The little equalizer on a resting card: four bars that follow how loud Dia's sound is (30 times a
 // second, only while the card shows and its tab plays), and lie low while it's paused. Each bar shows the
 // level a moment earlier than the one before it, so they ripple rather than move as one.
 struct Equalizer {
+    std::weak_ptr<void> owner;  // keeps the card alive for a timer callback, without forming a cycle
     muxc::StackPanel panel;
     std::vector<muxm::ScaleTransform> scales;
     std::vector<muxsh::Rectangle> bars;
@@ -818,7 +953,13 @@ struct Equalizer {
             if (!t_eqTimer) {
                 t_eqTimer = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread().CreateTimer();
                 t_eqTimer.Interval(std::chrono::milliseconds(33));
-                t_eqTimer.Tick([](auto&&, auto&&) { EqTick(); });
+                t_eqTimer.Tick([](auto&&, auto&&) {
+                    try { EqTick(); }
+                    catch (...) {
+                        if (t_eqTimer) t_eqTimer.Stop();
+                        Log("media: equalizer update failed; stopped its timer");
+                    }
+                });
             }
             if (!t_eqTimer.IsRunning()) t_eqTimer.Start();
         } else {
@@ -834,10 +975,19 @@ void EqTick() {
         if (t_eqTimer) t_eqTimer.Stop();
         return;
     }
+    std::vector<std::pair<std::shared_ptr<void>, Equalizer*>> visible;
+    for (auto* eq : t_eqs)
+        if (auto owner = eq->owner.lock(); owner && eq->panel.IsLoaded() && eq->panel.Opacity() > 0 && Shown(eq->panel))
+            visible.push_back({std::move(owner), eq});
+    if (visible.empty()) {
+        if (t_eqTimer) t_eqTimer.Interval(std::chrono::milliseconds(250));
+        return;  // no demand: the audio worker releases its meters and sleeps
+    }
+    if (t_eqTimer.Interval() != std::chrono::milliseconds(33)) t_eqTimer.Interval(std::chrono::milliseconds(33));
     static thread_local float history[8] = {};
     static thread_local int at = 0;
     static thread_local float lo = 0, hi = 0.05f;
-    float peak = t_meter.Peak();
+    float peak = ReadPeak();
     if (peak < 0) {  // (no session of Dia's found: a gentle pulse instead)
         double t = GetTickCount64() / 1000.0;
         peak = (float)(0.5 + 0.4 * std::sin(t * 5.3));
@@ -855,7 +1005,8 @@ void EqTick() {
     at = (at + 1) % 8;
     history[at] = n;
     const double weight[4] = {0.8, 1.0, 0.9, 0.7};
-    for (auto* eq : t_eqs) {
+    for (auto& [owner, eq] : visible) {
+        if (!eq->running) continue;
         for (int i = 0; i < 4; i++) {
             double v = std::pow((double)history[(at - i + 8) % 8], 1.3) * weight[i] * 1.15;
             double target = 0.12 + 0.88 * (v > 1 ? 1 : v);
@@ -868,7 +1019,9 @@ void EqTick() {
 
 struct Host;
 struct Card {
+    bool active = true;
     Host* host = nullptr;
+    std::weak_ptr<Host> owner;
     winrt::weak_ref<mux::FrameworkElement> row;  // Dia's tab row
     std::wstring title;
     bool dismissed = false, smtc = false, playing = false, muted = false, shown = false;
@@ -882,6 +1035,9 @@ struct Card {
     ULONGLONG standInSince = 0;              // since when it shows Chromium's stand-in
     muxm::ImageSource favicon{nullptr};
     int artGen = -1;
+    int artSession = -1;
+    unsigned long long artRequest = 0;
+    std::wstring artTitle;
     bool artIsFavicon = false;
     // On the stack: its place (0 front, 1 behind...), and whether it's
     // on its way out.
@@ -889,10 +1045,12 @@ struct Card {
     double pos = 0;
     double addedAt = 0, leftAt = 0;  // NowMs() it came onto the stack / began leaving
     double sizedW = -1, sizedH = -1;  // the size last given (set again only when it changes)
+    double layoutW = -1, layoutH = -1, layoutE = -1, layoutA = -1;
     // A new artwork: the tile turns over, and the new picture is on its back.
     double flipAt = -1;
     mux::UIElement nextArt{nullptr};
     mux::UIElement loadingArt{nullptr};  // a new artwork still decoding
+    wf::IAsyncAction artLoad{nullptr};
     std::weak_ptr<Card> self;
 
     muxc::Border root;
@@ -911,7 +1069,9 @@ struct Card {
         mute{kVolume, 15, kBtn}, close{kCloseG, 10, kClose};
 };
 
-struct Host {
+struct Host : std::enable_shared_from_this<Host> {
+    bool active = true;
+    RowCache rows;
     winrt::weak_ref<muxc::Grid> paging;
     winrt::weak_ref<mux::FrameworkElement> switcher;  // Dia's space switcher (the dots), whose row we share
     mux::VerticalAlignment switcherAlign = mux::VerticalAlignment::Stretch;
@@ -926,7 +1086,7 @@ struct Host {
     double closeAt = -1;
     double height = 0;  // the resting stack's height now (glides to the wanted one)
     double lastFrame = 0;
-    winrt::event_token render{};
+    winrt::event_token render{}, sizeChanged{};
     Smtc smtc;  // (as last read, for the progress bar between reads)
     winrt::weak_ref<mux::FrameworkElement> smtcRow;  // the tab the media session was last matched to
     int smtcSession = -1;                            // (and which session that was)
@@ -937,10 +1097,25 @@ struct Host {
     ULONGLONG seekAt = 0;
 };
 
-thread_local std::map<void*, Host> t_hosts;
+// An event keeps both its card and host alive until it returns; queued events become inert at teardown.
+struct CardAccess {
+    std::shared_ptr<Card> card;
+    std::shared_ptr<Host> host;
+    explicit operator bool() const { return card && card->active && host && host->active; }
+    Card* operator->() const { return card.get(); }
+    Card& operator*() const { return *card; }
+};
+
+CardAccess LockCard(const std::weak_ptr<Card>& weak) {
+    auto card = weak.lock();
+    auto host = card ? card->owner.lock() : nullptr;
+    return {std::move(card), std::move(host)};
+}
+
+thread_local std::map<void*, std::shared_ptr<Host>> t_hosts;
 thread_local struct {
     winrt::weak_ref<mux::FrameworkElement> row;  // a tab to tap once it's scrolled into view
-    Host* host = nullptr;
+    std::weak_ptr<Host> host;
     int tries = 0;
 } t_goTo;
 
@@ -962,36 +1137,71 @@ void Leave(Card& c) {
 // that select, but creating one makes Dia crash a little later.) A touch moves the pointer to where it
 // touched and hides it: it's put back where it was while hidden, then a mouse move of zero shows it
 // there. Runs on a thread of its own.
-void TouchTap(POINT at) {
-    Log("media: tapping the tab at %ld,%ld", at.x, at.y);  // (before it happens, in case it goes wrong)
-    std::thread([at] {
-        static std::once_flag once;
-        static bool ready = false;
-        std::call_once(once, [] { ready = InitializeTouchInjection(1, TOUCH_FEEDBACK_NONE) != FALSE; });
-        if (!ready) return Log("media: touch injection unavailable (%lu)", GetLastError());
-        POINTER_TOUCH_INFO t{};
-        t.pointerInfo.pointerType = PT_TOUCH;
-        t.pointerInfo.pointerId = 0;
-        t.pointerInfo.ptPixelLocation = at;
-        t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
-        t.orientation = 90;
-        t.pressure = 32000;
-        t.rcContact = {at.x - 2, at.y - 2, at.x + 2, at.y + 2};
-        t.pointerInfo.pointerFlags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
-        POINT back;
-        GetCursorPos(&back);
-        bool ok = InjectTouchInput(1, &t) != FALSE;
-        Sleep(35);
-        t.pointerInfo.pointerFlags = POINTER_FLAG_UP;
-        ok = InjectTouchInput(1, &t) != FALSE && ok;
-        Sleep(20);
-        SetCursorPos(back.x, back.y);
-        INPUT nudge{};
-        nudge.type = INPUT_MOUSE;
-        nudge.mi.dwFlags = MOUSEEVENTF_MOVE;  // (dx = dy = 0: the pointer shows again, where it was)
-        SendInput(1, &nudge, sizeof(INPUT));
-        Log(ok ? "media: tab opened" : "media: tap failed (%lu)", GetLastError());
-    }).detach();
+std::atomic<bool> g_tapping{false};
+
+bool TouchTap(POINT at, HWND target) {
+    if (g_tapping.exchange(true)) return false;
+    try {
+        Log("media: tapping the tab at %ld,%ld", at.x, at.y);  // (before it happens, in case it goes wrong)
+        std::thread([at, target] {
+            struct Done { ~Done() { g_tapping = false; } } done;
+            auto isTarget = [=] {
+                auto under = WindowFromPoint(at);
+                return IsWindow(target) && GetForegroundWindow() == target && under &&
+                       GetAncestor(under, GA_ROOT) == target;
+            };
+            // Don't send a delayed tap into a different window or over a newly opened menu.
+            if (!isTarget() || GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0) return;
+            static std::once_flag once;
+            static bool ready = false;
+            std::call_once(once, [] { ready = InitializeTouchInjection(1, TOUCH_FEEDBACK_NONE) != FALSE; });
+            if (!ready) { Log("media: touch injection unavailable (%lu)", GetLastError()); return; }
+            POINTER_TOUCH_INFO t{};
+            t.pointerInfo.pointerType = PT_TOUCH;
+            t.pointerInfo.pointerId = 0;
+            t.pointerInfo.ptPixelLocation = at;
+            t.touchMask = TOUCH_MASK_CONTACTAREA | TOUCH_MASK_ORIENTATION | TOUCH_MASK_PRESSURE;
+            t.orientation = 90;
+            t.pressure = 512;  // TOUCH_MASK_PRESSURE accepts 0..1024
+            t.rcContact = {at.x - 2, at.y - 2, at.x + 2, at.y + 2};
+            t.pointerInfo.pointerFlags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+            POINT back{};
+            if (!GetCursorPos(&back) || !isTarget()) return;
+            bool ok = InjectTouchInput(1, &t) != FALSE;
+            if (!ok) { Log("media: touch down failed (%lu)", GetLastError()); return; }
+            Sleep(35);
+            t.pointerInfo.pointerFlags = POINTER_FLAG_UP;
+            // Always release a successful contact, even if focus changed while it was down.
+            for (int retry = 0; retry < 3; ++retry) {
+                ok = InjectTouchInput(1, &t) != FALSE;
+                if (ok || GetLastError() != ERROR_NOT_READY) break;
+                Sleep(1);
+            }
+            if (!ok) {
+                t.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_CANCELED;
+                InjectTouchInput(1, &t);
+            }
+            Sleep(20);
+            POINT current{};
+            // Touch normally parks the cursor at its contact point. Only restore it if it is still there:
+            // don't restore over a different observed position or in another foreground app.
+            bool restored = ok && GetForegroundWindow() == target && GetCursorPos(&current) &&
+                current.x == at.x && current.y == at.y && GetAsyncKeyState(VK_LBUTTON) >= 0 &&
+                GetAsyncKeyState(VK_RBUTTON) >= 0;
+            if (restored) {
+                SetCursorPos(back.x, back.y);
+                INPUT nudge{};
+                nudge.type = INPUT_MOUSE;
+                nudge.mi.dwFlags = MOUSEEVENTF_MOVE;  // show it at the restored position
+                SendInput(1, &nudge, sizeof(INPUT));
+            }
+            Log(ok ? "media: tab tap sent" : "media: tap failed (%lu)", GetLastError());
+        }).detach();
+        return true;
+    } catch (...) {
+        g_tapping = false;
+        return false;
+    }
 }
 
 // Taps Dia's row for the tab. False if the row isn't on screen yet (it's being scrolled into view).
@@ -1016,8 +1226,7 @@ bool TapRow(Host& h, const mux::FrameworkElement& row) {
     // them for a moment.
     h.stack.IsHitTestVisible(false);
     h.tapThroughUntil = GetTickCount64() + 400;
-    TouchTap(at);
-    return true;
+    return TouchTap(at, top);
 }
 
 // Goes to the card's tab. The card sinks away at once, not when Dia gets there.
@@ -1030,7 +1239,7 @@ void GoToTab(Card& c) {
     mux::BringIntoViewOptions opts;
     opts.AnimationDesired(false);
     row.StartBringIntoView(opts);
-    t_goTo.row = winrt::make_weak(row), t_goTo.host = c.host, t_goTo.tries = 10;  // tapped once it's in view (Media_Tick)
+    t_goTo.row = winrt::make_weak(row), t_goTo.host = c.owner, t_goTo.tries = 10;  // tapped once it's in view (Media_Tick)
 }
 
 void PressSpeaker(Card& c) {
@@ -1047,6 +1256,7 @@ void PressSpeaker(Card& c) {
 }
 
 void SetOpen(Host& h, bool open) {
+    if (!h.active) return;
     h.closeAt = -1;
     if (open && h.shown.empty()) open = false;
     if (!open)
@@ -1087,7 +1297,7 @@ void HookSeek(const std::shared_ptr<Card>& card) {
         return w > 0 ? std::clamp(x / w, 0.0, 1.0) : 0.0;
     };
     card->bar.PointerPressed([weak, frac](wf::IInspectable const&, mux::Input::PointerRoutedEventArgs const& e) {
-        auto c = weak.lock();
+        auto c = LockCard(weak);
         if (!c || !c->smtc || !c->host->smtc.canSeek || c->host->t < 0.5) return;
         c->dragging = c->bar.CapturePointer(e.Pointer());
         c->dragFrac = frac(*c, e);
@@ -1095,15 +1305,15 @@ void HookSeek(const std::shared_ptr<Card>& card) {
         e.Handled(true);
     });
     card->bar.PointerMoved([weak, frac](wf::IInspectable const&, mux::Input::PointerRoutedEventArgs const& e) {
-        if (auto c = weak.lock(); c && c->dragging) c->dragFrac = frac(*c, e), EnsureFrames(*c->host);
+        if (auto c = LockCard(weak); c && c->dragging) c->dragFrac = frac(*c, e), EnsureFrames(*c->host);
     });
     auto end = [weak, frac](wf::IInspectable const&, mux::Input::PointerRoutedEventArgs const& e) {
-        auto c = weak.lock();
+        auto c = LockCard(weak);
         if (!c || !c->dragging) return;
         c->dragging = false;
         c->dragFrac = frac(*c, e);
         double to = c->dragFrac * c->host->smtc.duration;
-        Send(kSeek, to);
+        Send(kSeek, c->host->smtc.session, to);
         // Show it there at once; the session catches up on its next read.
         c->host->smtc.position = to, c->host->smtc.at = GetTickCount64();
         c->host->seekTo = to, c->host->seekAt = c->host->smtc.at;
@@ -1112,13 +1322,15 @@ void HookSeek(const std::shared_ptr<Card>& card) {
     };
     card->bar.PointerReleased(end);
     card->bar.PointerCaptureLost([weak](auto&&, auto&&) {
-        if (auto c = weak.lock()) c->dragging = false;
+        if (auto c = LockCard(weak)) c->dragging = false;
     });
 }
 
 std::shared_ptr<Card> MakeCard(Host& h) {
     auto c = std::make_shared<Card>();
     c->host = &h;
+    c->owner = h.shared_from_this();
+    c->eq.owner = c;
     c->self = c;
     std::weak_ptr<Card> weak = c;
 
@@ -1139,7 +1351,7 @@ std::shared_ptr<Card> MakeCard(Host& h) {
     } catch (...) {
     }
     c->root.Loaded([weak](auto&&, auto&&) {
-        if (auto c = weak.lock()) c->loaded = true;
+        if (auto c = LockCard(weak)) c->loaded = true;
     });
     c->inner.Background(Solid({0x01, 0, 0, 0}));  // (takes the pointer everywhere on the card)
     c->inner.Clip(c->innerClip);
@@ -1186,12 +1398,12 @@ std::shared_ptr<Card> MakeCard(Host& h) {
     for (auto* b : {&c->open, &c->prev, &c->play, &c->next, &c->mute, &c->close}) c->inner.Children().Append(b->b);
     HookSeek(c);
 
-    c->open.b.Click([weak](auto&&, auto&&) { if (auto c = weak.lock()) GoToTab(*c); });
-    c->prev.b.Click([weak](auto&&, auto&&) { if (auto c = weak.lock(); c && c->smtc) Send(kPrev); });
-    c->next.b.Click([weak](auto&&, auto&&) { if (auto c = weak.lock(); c && c->smtc) Send(kNext); });
+    c->open.b.Click([weak](auto&&, auto&&) { if (auto c = LockCard(weak)) GoToTab(*c); });
+    c->prev.b.Click([weak](auto&&, auto&&) { if (auto c = LockCard(weak); c && c->smtc) Send(kPrev, c->host->smtc.session); });
+    c->next.b.Click([weak](auto&&, auto&&) { if (auto c = LockCard(weak); c && c->smtc) Send(kNext, c->host->smtc.session); });
     c->play.b.Click([weak](auto&&, auto&&) {
-        if (auto c = weak.lock(); c && c->smtc) {
-            Send(kToggle);
+        if (auto c = LockCard(weak); c && c->smtc) {
+            Send(kToggle, c->host->smtc.session);
             // Show the change at once; the session's own state follows a moment later.
             c->playing = !c->playing;
             c->playWant = c->playing, c->playWantUntil = GetTickCount64() + 2500;
@@ -1200,21 +1412,21 @@ std::shared_ptr<Card> MakeCard(Host& h) {
         }
     });
     c->mute.b.Click([weak](auto&&, auto&&) {
-        if (auto c = weak.lock()) PressSpeaker(*c);
+        if (auto c = LockCard(weak)) PressSpeaker(*c);
     });
     c->close.b.Click([weak](auto&&, auto&&) {
-        if (auto c = weak.lock()) c->dismissed = true, Leave(*c), Log("media: card dismissed");
+        if (auto c = LockCard(weak)) c->dismissed = true, Leave(*c), Log("media: card dismissed");
     });
     c->root.PointerEntered([weak](auto&&, auto&&) {
-        if (auto c = weak.lock(); c && !c->leaving) SetOpen(*c->host, true);
+        if (auto c = LockCard(weak); c && !c->leaving) SetOpen(*c->host, true);
     });
     // A short wait, so moving between the cards, or out and straight back, doesn't flicker.
     c->root.PointerExited([weak](auto&&, auto&&) {
-        if (auto c = weak.lock()) c->host->closeAt = NowMs() + kCloseDelayMs, EnsureFrames(*c->host);
+        if (auto c = LockCard(weak)) c->host->closeAt = NowMs() + kCloseDelayMs, EnsureFrames(*c->host);
     });
     // A click on the card itself (not a button or the bar) goes to the tab.
     c->root.Tapped([weak](wf::IInspectable const&, mux::Input::TappedRoutedEventArgs const& e) {
-        auto c = weak.lock();
+        auto c = LockCard(weak);
         if (!c || c->leaving) return;
         for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d; d = muxm::VisualTreeHelper::GetParent(d)) {
             if (d.try_as<muxc::Primitives::ButtonBase>()) return;
@@ -1240,6 +1452,22 @@ void ShowArt(Card& c, const mux::UIElement& next, bool animate) {
 // turns in only once it has loaded, and the last song's stays until then: no site icon in between (that
 // shows only if no artwork comes at all).
 void SetArt(Card& c, const Smtc& s, bool animate) {
+    int session = c.smtc ? s.session : -1;
+    std::wstring title = c.smtc ? s.title : L"";
+    if (session != c.artSession || title != c.artTitle) {
+        ++c.artRequest;
+        try { if (c.artLoad) c.artLoad.Cancel(); } catch (...) {}
+        c.artLoad = nullptr;
+        c.artSession = session;
+        c.artTitle = std::move(title);
+        c.artGen = -1;
+        c.nextArt = nullptr;
+        if (auto previous = c.loadingArt) {
+            c.loadingArt = nullptr;
+            uint32_t i;
+            if (c.artBox.Children().IndexOf(previous, i)) c.artBox.Children().RemoveAt(i);
+        }
+    }
     mux::UIElement next{nullptr};
     bool ours = s.artOwner == s.title;
     if (c.smtc && s.art && ours) {
@@ -1258,32 +1486,34 @@ void SetArt(Card& c, const Smtc& s, bool animate) {
                 if (c.artBox.Children().IndexOf(prev, i)) c.artBox.Children().RemoveAt(i);
             }
             c.loadingArt = img;
+            auto request = ++c.artRequest;
             std::weak_ptr<Card> weak = c.self;
             auto wimg = winrt::make_weak(img);
-            bmp.ImageOpened([weak, wimg, animate](auto&&, auto&&) {
-                auto c = weak.lock();
+            bmp.ImageOpened([weak, wimg, animate, request](auto&&, auto&&) {
+                auto c = LockCard(weak);
                 auto img = wimg.get();
-                if (!c || !img) return;
+                if (!c || !img || c->artRequest != request) return;
                 uint32_t i;
                 if (c->artBox.Children().IndexOf(img, i)) c->artBox.Children().RemoveAt(i);
                 if (c->loadingArt != img) return;  // (a newer one came meanwhile)
                 c->loadingArt = nullptr;
+                c->artLoad = nullptr;
                 img.Opacity(1);
                 ShowArt(*c, img, animate);
             });
-            bmp.ImageFailed([weak, wimg](auto&&, auto&&) {
-                auto c = weak.lock();
+            bmp.ImageFailed([weak, wimg, request](auto&&, auto&&) {
+                auto c = LockCard(weak);
                 auto img = wimg.get();
-                if (!c || !img) return;
+                if (!c || !img || c->artRequest != request) return;
                 uint32_t i;
                 if (c->artBox.Children().IndexOf(img, i)) c->artBox.Children().RemoveAt(i);
-                if (c->loadingArt == img) c->loadingArt = nullptr;
+                if (c->loadingArt == img) c->loadingArt = nullptr, c->artLoad = nullptr;
             });
             // It loads out of sight in the tile (an image that isn't on screen may never load).
             img.Opacity(0);
             img.IsHitTestVisible(false);
             c.artBox.Children().InsertAt(0, img);
-            bmp.SetSourceAsync(s.art.CloneStream());
+            c.artLoad = bmp.SetSourceAsync(s.art.CloneStream());
         } catch (...) {
         }
         return;
@@ -1359,6 +1589,10 @@ void UpdateProgress(Card& c, const Smtc& s, double w) {
 // card tucked behind the front one (0 while it only peeks). Coordinates are inside the 1px border.
 void LayoutCard(Card& c, double w, double h, double e, double a, const Smtc& s) {
     w -= 2, h -= 2;
+    if (c.layoutW == w && c.layoutH == h && c.layoutE == e && c.layoutA == a) {
+        UpdateProgress(c, s, w);
+        return;
+    }
     c.innerClip.Rect({0, 0, (float)w, (float)h});
     // Header: the artwork, the title over the artist, the equalizer (rest) or ✕ (open).
     double artSize = Lerp(36, 44, e), artX = Lerp(7, 11, e), artY = Lerp(7, 11, e);
@@ -1396,6 +1630,7 @@ void LayoutCard(Card& c, double w, double h, double e, double a, const Smtc& s) 
         row[i]->b.Opacity(pe);
         row[i]->b.IsHitTestVisible(e > 0.6 && a > 0.5);
     }
+    c.layoutW = w, c.layoutH = h, c.layoutE = e, c.layoutA = a;
 }
 
 // Into place, or away (the compositor animates the change).
@@ -1426,6 +1661,7 @@ void Park(Host& h, Card& c) {
 // narrower, with only its top edge showing; open, all of them fan out at full size above the front card.
 // A card's place (pos) glides, so the cards behind move up smoothly when the front one goes.
 void LayoutStack(Host& h) {
+    if (!h.active) return;
     double rest = h.height;
     if (h.stack.Height() != rest) h.stack.Height(rest);
     mux::Thickness m{8, 0, 8, h.below + (rest > 0 ? kGap : 0)};
@@ -1442,7 +1678,8 @@ void LayoutStack(Host& h) {
         double inset = Lerp(behind * kPeekInset, 0, e), top = Lerp(restTop, openTop, e), ch = Lerp(kRestH, kOpenH, e);
         double cw = w - 2 * inset;
         Put(c.root, inset, top);
-        muxc::Canvas::SetZIndex(c.root, 100 - (int)std::lround(c.pos * 10));
+        int z = 100 - (int)std::lround(c.pos * 10);
+        if (muxc::Canvas::GetZIndex(c.root) != z) muxc::Canvas::SetZIndex(c.root, z);
         if (cw != c.sizedW || ch != c.sizedH) {
             c.sizedW = cw, c.sizedH = ch;
             c.root.Width(cw);
@@ -1460,6 +1697,14 @@ double WantedHeight(const Host& h) {
 }
 
 void OnFrame(Host& h) {
+    if (!h.active) return;
+    if (!h.stack.IsLoaded() || !Shown(h.stack)) {
+        auto token = h.render;
+        h.render = {};
+        h.lastFrame = 0;
+        if (token.value) muxm::CompositionTarget::Rendering(token);
+        return;
+    }
     double now = NowMs();
     double dt = h.lastFrame ? now - h.lastFrame : 16;
     if (dt > 50) dt = 50;
@@ -1522,34 +1767,56 @@ void OnFrame(Host& h) {
 }
 
 void EnsureFrames(Host& h) {
-    if (h.render.value) return;
-    Host* hp = &h;
+    if (!h.active || h.render.value) return;
+    std::weak_ptr<Host> weak = h.shared_from_this();
     h.lastFrame = 0;
-    h.render = mux::Media::CompositionTarget::Rendering([hp](auto&&, auto&&) {
+    h.render = mux::Media::CompositionTarget::Rendering([weak](auto&&, auto&&) {
+        auto host = weak.lock();
+        if (!host || !host->active) return;
         try {
-            OnFrame(*hp);
+            OnFrame(*host);
         } catch (...) {
+            // A failed layout must not leave a failing callback subscribed on every frame forever.
+            auto token = host->render;
+            host->render = {};
+            try { if (token.value) muxm::CompositionTarget::Rendering(token); } catch (...) {}
+            Log("media: frame failed; animation stopped");
         }
     });
 }
 
 void RemoveHost(Host& h) {
+    h.active = false;  // before any XAML call can deliver a nested event
+    auto render = h.render, sizeChanged = h.sizeChanged;
+    h.render = h.sizeChanged = {};
+    try { if (render.value) muxm::CompositionTarget::Rendering(render); } catch (...) {}
+    try { if (sizeChanged.value && h.stack) h.stack.SizeChanged(sizeChanged); } catch (...) {}
+    // Each cleanup is independent: a disconnected element must not skip the other subscriptions.
+    auto retire = [](const std::shared_ptr<Card>& c) {
+        c->active = false;
+        c->artRequest++;
+        try { if (c->artLoad) c->artLoad.Cancel(); } catch (...) {}
+        c->artLoad = nullptr;
+        c->dragging = false;
+        try { c->eq.Run(false); } catch (...) {}
+        try { c->bar.ReleasePointerCaptures(); } catch (...) {}
+        try { c->root.IsHitTestVisible(false); } catch (...) {}
+    };
+    for (auto& c : h.cards) retire(c);
+    for (auto& c : h.onStack) retire(c);
     try {
-        if (h.render.value) mux::Media::CompositionTarget::Rendering(h.render), h.render = {};
-        for (auto& c : h.cards) c->eq.Run(false);
-        for (auto& c : h.onStack) c->eq.Run(false);
         if (auto g = h.paging.get()) {
             uint32_t i;
             if (h.stack && g.Children().IndexOf(h.stack, i)) g.Children().RemoveAt(i);
         }
-        if (auto sw = h.switcher.get()) sw.VerticalAlignment(h.switcherAlign);  // (as Dia had it)
-        h.switcher = nullptr;
     } catch (...) {
     }
+    try { if (auto sw = h.switcher.get()) sw.VerticalAlignment(h.switcherAlign); } catch (...) {}
+    h.switcher = nullptr;
     h.cards.clear();
     h.shown.clear();
     h.onStack.clear();
-    if (t_goTo.host == &h) t_goTo.tries = 0, t_goTo.row = nullptr, t_goTo.host = nullptr;
+    if (t_goTo.host.lock().get() == &h) t_goTo.tries = 0, t_goTo.row = nullptr, t_goTo.host.reset();
 }
 
 // The stack shares the sidebar's bottom row with the space switcher (the dots), sitting just above it:
@@ -1563,7 +1830,12 @@ bool EnsureHost(Host& h, const muxc::Grid& paging) {
         h.stack.VerticalAlignment(mux::VerticalAlignment::Bottom);
         h.stack.Margin({8, 0, 8, 0});
         h.stack.Height(0);
-        h.stack.SizeChanged([hp = &h](auto&&, auto&&) { LayoutStack(*hp); });
+        std::weak_ptr<Host> weak = h.shared_from_this();
+        h.sizeChanged = h.stack.SizeChanged([weak](auto&&, auto&&) {
+            if (auto host = weak.lock(); host && host->active) {
+                try { LayoutStack(*host); } catch (...) { Log("media: size layout failed"); }
+            }
+        });
         paging.Children().Append(h.stack);  // (last: drawn over the tab list while open)
         Log("media: card area added");
     }
@@ -1616,7 +1888,7 @@ void UpdateHost(Host& h, const muxc::Grid& paging, const Smtc& now_, bool pip, C
                 h.seekTo = -1;
         }
     }
-    auto rows = RowsIn(paging, h.stack);
+    auto rows = RowsIn(paging, h.stack, h.rows);
     ULONGLONG now = GetTickCount64();
     if (h.tapThroughUntil && now >= h.tapThroughUntil) h.tapThroughUntil = 0, h.stack.IsHitTestVisible(true);
     Theme theme = ThemeOf(paging, profile);
@@ -1761,6 +2033,10 @@ void UpdateHost(Host& h, const muxc::Grid& paging, const Smtc& now_, bool pip, C
     // Cards no longer tracked go from the stack (parked ones at once; leaving ones once they've gone).
     for (auto& c : h.cards)
         if (!c->onStack && std::find(keep.begin(), keep.end(), c) == keep.end()) {
+            c->active = false;
+            ++c->artRequest;
+            try { if (c->artLoad) c->artLoad.Cancel(); } catch (...) {}
+            c->artLoad = nullptr;
             uint32_t i;
             if (h.stack.Children().IndexOf(c->root, i)) h.stack.Children().RemoveAt(i);
             c->eq.Run(false);
@@ -1782,16 +2058,19 @@ void Media_Tick() {
     tick++;
     if (t_goTo.tries > 0) {
         auto row = t_goTo.row.get();
-        if (!row || TapRow(*t_goTo.host, row) || --t_goTo.tries == 0) t_goTo.tries = 0, t_goTo.row = nullptr;
+        auto host = t_goTo.host.lock();
+        if (!host || !host->active || !row || TapRow(*host, row) || --t_goTo.tries == 0)
+            t_goTo.tries = 0, t_goTo.row = nullptr, t_goTo.host.reset();
     }
     bool on = Engine_TweakOn(L"mediaControls");
     RunWorker(on);
     if (!on) {
-        for (auto& [k, h] : t_hosts) RemoveHost(h);
+        for (auto& [k, h] : t_hosts) RemoveHost(*h);
         t_hosts.clear();
         return;
     }
     if (tick % 3) return;
+    auto tickStart = GetTickCount64();
     try {
         Smtc s = Snapshot();
         bool pip = Engine_TweakOn(L"mediaControlsPiP") && PipOpen();
@@ -1806,12 +2085,30 @@ void Media_Tick() {
             }
             return d;
         };
+        static thread_local std::vector<winrt::weak_ref<muxc::Border>> tintRefs;
+        static thread_local std::vector<winrt::weak_ref<muxc::Grid>> pagingRefs;
+        static thread_local unsigned long long revision = ~0ull;
+        static thread_local ULONGLONG scanned = 0;
+        auto currentRevision = Engine_TreeRevision();
+        if (revision != currentRevision || tickStart - scanned >= 2000) {
+            tintRefs.clear();
+            pagingRefs.clear();
+            Engine_ForEachNode([&](const NodeRef& n) {
+                if (n.name == L"SidebarFloatingTint") {
+                    if (auto border = Obj<muxc::Border>(n.handle)) tintRefs.push_back(winrt::make_weak(border));
+                } else if (n.name == L"SpacePagingRoot") {
+                    if (auto grid = Obj<muxc::Grid>(n.handle)) pagingRefs.push_back(winrt::make_weak(grid));
+                }
+            });
+            revision = currentRevision;
+            scanned = tickStart;
+        }
         std::vector<std::pair<mux::DependencyObject, Color>> tints;
         std::vector<muxc::Grid> pagings;
-        Engine_ForEachNode([&](const NodeRef& n) {
-            if (n.name == L"SidebarFloatingTint") {
+        for (auto& ref : tintRefs) {
+            if (auto border = ref.get()) {
                 // A gradient (or a solid color): its most colorful stop.
-                auto bg = Obj<muxc::Border>(n.handle) ? Obj<muxc::Border>(n.handle).Background() : nullptr;
+                auto bg = border.Background();
                 std::vector<Color> cs;
                 if (auto sb = bg.try_as<muxm::SolidColorBrush>()) cs.push_back(sb.Color());
                 if (auto gb = bg.try_as<muxm::GradientBrush>())
@@ -1822,16 +2119,24 @@ void Media_Tick() {
                     int sat = c.A < 0x40 ? -1 : (std::max)({c.R, c.G, c.B}) - (std::min)({c.R, c.G, c.B});
                     if (sat > bestSat) bestSat = sat, best = c;
                 }
-                if (bestSat >= 0) tints.push_back({topOf(Obj<muxc::Border>(n.handle)), best});
-            } else if (n.name == L"SpacePagingRoot") {
-                auto g = Obj<muxc::Grid>(n.handle);
-                if (g && g.IsLoaded()) pagings.push_back(g);
+                if (bestSat >= 0) tints.push_back({topOf(border), best});
             }
-        });
+        }
+        for (auto& ref : pagingRefs)
+            if (auto grid = ref.get(); grid && grid.IsLoaded()) pagings.push_back(grid);
         std::set<void*> live;
         for (auto& g : pagings) {
             void* key = winrt::get_abi(g);
-            Host& h = t_hosts[key];
+            auto& entry = t_hosts[key];
+            // XAML can reuse an address after a window/space is destroyed. A new root needs a new host,
+            // even if its interface pointer happens to match the old map key.
+            if (entry && entry->paging.get() != g) {
+                RemoveHost(*entry);
+                entry.reset();
+            }
+            if (!entry) entry = std::make_shared<Host>();
+            auto host = entry;
+            Host& h = *host;
             Color profile{};
             auto top = topOf(g);
             for (auto& [root, c] : tints)
@@ -1842,12 +2147,18 @@ void Media_Tick() {
             UpdateHost(h, g, s, pip, profile);
         }
         for (auto it = t_hosts.begin(); it != t_hosts.end();)
-            if (!live.count(it->first)) RemoveHost(it->second), it = t_hosts.erase(it);
+            if (!live.count(it->first)) RemoveHost(*it->second), it = t_hosts.erase(it);
             else ++it;
     } catch (winrt::hresult_error const& e) {
         Log("media: tick 0x%08lx", (unsigned long)e.code());
     } catch (...) {
         Log("media: tick error");
+    }
+    auto elapsed = GetTickCount64() - tickStart;
+    static thread_local ULONGLONG lastSlowLog = 0;
+    if (elapsed >= 50 && tickStart - lastSlowLog >= 10000) {
+        lastSlowLog = tickStart;
+        Log("media: slow UI update %llu ms", elapsed);
     }
 }
 
