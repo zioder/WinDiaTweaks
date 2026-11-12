@@ -4524,6 +4524,15 @@ struct ArcState {
     // ☆ / ⋯ moved so ⋯ sits flush in the pill's corner: the stack, and Dia's own RenderTransform for it.
     winrt::weak_ref<mux::UIElement> flushed;
     muxm::Transform flushedTransform{nullptr};
+    // Dia's address field stays in its toolbar: moving its ☆ / ⋯ buttons out of their tree leaves them
+    // dead (Click still fires but no menu opens). Only the buttons are drawn over the pill (FlushArcTrailing).
+    winrt::weak_ref<mux::FrameworkElement> address;
+    muxm::Transform addressTransform{nullptr};  // Dia's own values, put back when it's returned
+    double addressMaxWidth = 0;
+    winrt::weak_ref<mux::UIElement> addressHit;  // Dia's text/title hit area, made click-through
+    std::vector<winrt::hstring> addressKeys;      // sidebar brushes we added to the field's resources
+    std::vector<winrt::weak_ref<mux::UIElement>> noFocusRing;  // ☆ / ⋯ without a focus ring in the pill
+    std::vector<std::pair<winrt::weak_ref<mux::UIElement>, int>> zSaved;  // paint order we changed (Dia's z)
 };
 static thread_local std::map<InstanceHandle, ArcState> t_arc;
 
@@ -4580,6 +4589,32 @@ static void ReturnMoved(ArcState& st) {
         if (auto c = d.try_as<muxc::Control>()) c.IsTabStop(st.displayTab);
     }
     st.display = nullptr;
+    if (auto hit = st.addressHit.get()) hit.IsHitTestVisible(true);
+    st.addressHit = nullptr;
+    for (auto& w : st.noFocusRing)
+        if (auto u = w.get()) u.ClearValue(mux::UIElement::UseSystemFocusVisualsProperty());
+    st.noFocusRing.clear();
+    if (auto address = st.address.get()) {
+        for (auto& k : st.addressKeys)
+            if (address.Resources().HasKey(winrt::box_value(k))) address.Resources().Remove(winrt::box_value(k));
+        address.RenderTransform(st.addressTransform);
+        address.MaxWidth(st.addressMaxWidth);
+        address.ClearValue(mux::FrameworkElement::RequestedThemeProperty());
+        if (auto tr = FindByName(address, L"UrlBarTrailingStack")) {  // undo the hover fade
+            tr.IsHitTestVisible(true);
+            try {
+                auto v = winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(tr);
+                v.StopAnimation(L"Opacity");
+                v.Opacity(1.0f);
+            } catch (...) {
+            }
+        }
+    }
+    st.address = nullptr;
+    st.addressKeys.clear();
+    for (auto& [w, z] : st.zSaved)
+        if (auto el = w.get()) muxc::Canvas::SetZIndex(el, z);
+    st.zSaved.clear();
     for (auto it = st.moved.rbegin(); it != st.moved.rend(); ++it) {
         auto el = it->el.get();
         auto from = it->from.get();
@@ -4669,12 +4704,20 @@ static bool PointerLeftWindow(const mux::FrameworkElement& el) {
 // Pointer moves anywhere in the window (handled ones too): hover follows them, so a leave (or an
 // enter) the pill's own events missed, e.g. while Dia moved its controls in, is caught on the next move.
 static void TrackArcPointer(const mux::FrameworkElement& el);
+static bool InBounds(const mux::FrameworkElement& el, mux::Input::PointerRoutedEventArgs const& e);
+
+// Dia's address field for the pill: left in its toolbar in the sidebar (see ArcState::address).
+static mux::FrameworkElement ArcHost(const ArcState& st) {
+    if (auto address = st.address.get()) return address;
+    auto url = st.url.get();
+    return url ? FindByName(url, L"AssistantBarHost") : nullptr;
+}
 
 // ☆ / ⋯ fade in while the pointer is over the pill and out when it leaves (Arc's clean pill).
 static void UpdateArcTrailing(ArcState& st, bool animate) {
     auto url = st.url.get();
     if (!url) return;
-    auto host = FindByName(url, L"AssistantBarHost");
+    auto host = ArcHost(st);
     auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
     if (!trailing) return;
     if (trailing.Opacity() != 1) trailing.Opacity(1);  // Dia's own hover binding; ours drives the fade
@@ -4703,9 +4746,68 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
 // small inset from the top, bottom and right edges, with corners that follow the pill's.
 static void FlushArcTrailing(ArcState& st) {
     auto url = st.url.get().try_as<mux::FrameworkElement>();
-    auto host = url ? FindByName(url, L"AssistantBarHost") : nullptr;
+    auto host = url ? ArcHost(st) : nullptr;
     auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
     if (!trailing || url.ActualHeight() <= 0) return;
+    if (host == st.address.get()) {
+        // Still in the toolbar's tree: take the sidebar's theme, not the page's, and draw the toolbar's
+        // branch above the sidebar (at the panel they share) so the buttons show and take clicks there.
+        if (host.RequestedTheme() != url.ActualTheme()) host.RequestedTheme(url.ActualTheme());
+        // Drawn over the pill at the pill's size (the buttons can't be moved out of Dia's field alone: its
+        // rounded border clips them). Dia's text area lets clicks through to the pill, which opens the
+        // command bar itself (BuildArcRows); only the buttons take the pointer.
+        if (std::abs(host.MaxWidth() - url.ActualWidth()) > 0.25) host.MaxWidth(url.ActualWidth());
+        auto move = host.RenderTransform().try_as<muxm::TranslateTransform>();
+        if (!move || move == st.addressTransform) move = muxm::TranslateTransform{}, host.RenderTransform(move);
+        try {
+            auto at = host.TransformToVisual(url).TransformPoint({0, 0});
+            if (std::abs(at.X) > 0.25) move.X(move.X() - at.X);
+            if (std::abs(at.Y) > 0.25) move.Y(move.Y() - at.Y);
+        } catch (...) {
+        }
+        // A menu closed with Esc gives its button keyboard focus, whose ring would stay after the buttons fade.
+        for (auto const& c : trailing.Children())
+            if (auto u = c.try_as<mux::UIElement>(); u && u.UseSystemFocusVisuals()) {
+                u.UseSystemFocusVisuals(false);
+                st.noFocusRing.push_back(winrt::make_weak(u));
+            }
+        if (auto hit = FindByName(host, L"UrlBarHitTarget")) {
+            if (st.addressHit.get() != hit) st.addressHit = winrt::make_weak(hit.as<mux::UIElement>());
+            if (hit.IsHitTestVisible()) hit.IsHitTestVisible(false);
+        }
+        std::vector<mux::DependencyObject> chain;
+        for (mux::DependencyObject d = url; d; d = muxm::VisualTreeHelper::GetParent(d)) chain.push_back(d);
+        for (mux::DependencyObject d = host; d;) {
+            auto parent = muxm::VisualTreeHelper::GetParent(d);
+            if (!parent) break;
+            if (std::find(chain.begin(), chain.end(), parent) == chain.end()) {
+                d = parent;
+                continue;
+            }
+            auto layer = d.try_as<mux::UIElement>();
+            auto panel = parent.try_as<muxc::Panel>();
+            if (layer && panel) {
+                // Paint order at that panel (all z 0, by index): page (with this toolbar), ..., sidebar, then
+                // Dia's overlay layers (command bar, ...). Keep that order but put the page just above the
+                // sidebar: sidebar 1, page 2, everything after the sidebar 3. (Not above the overlays: the page
+                // would cover the command bar.)
+                auto setZ = [&](const mux::UIElement& el, int z) {
+                    bool known = false;
+                    for (auto& [w, orig] : st.zSaved) known |= w.get() == el;
+                    if (!known) st.zSaved.push_back({winrt::make_weak(el), muxc::Canvas::GetZIndex(el)});
+                    if (muxc::Canvas::GetZIndex(el) < z) muxc::Canvas::SetZIndex(el, z);
+                };
+                bool afterSidebar = false;
+                for (auto const& c : panel.Children()) {
+                    if (c == layer) continue;
+                    if (std::find(chain.begin(), chain.end(), c) != chain.end()) setZ(c, 1), afterSidebar = true;
+                    else if (afterSidebar) setZ(c, 3);
+                }
+                if (afterSidebar) setZ(layer, 2);
+            }
+            break;
+        }
+    }
     muxc::Button last{nullptr};
     std::vector<muxc::Button> buttons;
     for (auto const& c : trailing.Children())
@@ -4755,7 +4857,7 @@ static void UpdateArcLabel(ArcState& st) {
                     if (auto pill = muxm::VisualTreeHelper::GetParent(label).try_as<muxc::Panel>()) st.url = winrt::make_weak(pill);
             }
     if (!label) return;
-    if (auto url = st.url.get()) AttachDisplay(st, FindByName(url, L"AssistantBarHost"));
+    if (st.url.get()) AttachDisplay(st, ArcHost(st));
     auto reb = st.display.get().try_as<muxc::RichEditBox>();
     if (!reb) {
         if (!label.Text().empty()) label.Text(L"");  // never show the previous tab's site
@@ -4780,9 +4882,11 @@ static void UpdateArcLabel(ArcState& st) {
     url.UpdateLayout();  // after a tab switch the new tab's chip/buttons must be measured before we place the label
     double left = 12, right = 12;
     try {
-        // Never closer to the pill's edge than on the right.
-        left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
-        auto host = FindByName(url, L"AssistantBarHost");
+        // Never closer to the pill's edge than on the right. (Dia's text is in the pill only outside the
+        // sidebar; there it stays in the toolbar.)
+        if (!st.address.get())
+            left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
+        auto host = ArcHost(st);
         auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
         if (!st.hover)
             right = 12;  // buttons hidden: the site can use the whole pill
@@ -4795,7 +4899,11 @@ static void UpdateArcLabel(ArcState& st) {
     mux::Thickness m{left, 0, right, 0};
     auto cur = label.Margin();
     if (std::abs(cur.Left - m.Left) > 0.5 || std::abs(cur.Right - m.Right) > 0.5) label.Margin(m);
-    if (label.Foreground() != reb.Foreground()) label.Foreground(reb.Foreground());
+    auto color = reb.Foreground();
+    if (st.address.get())
+        if (auto header = st.header.get())
+            if (auto ref = FindByName(header, L"OverflowButton").try_as<muxc::Control>()) color = ref.Foreground();
+    if (label.Foreground() != color) label.Foreground(color);
     if (label.FontFamily() != reb.FontFamily()) label.FontFamily(reb.FontFamily());
 }
 
@@ -4977,7 +5085,10 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st);
     });
-    url.PointerExited([](wf::IInspectable const& sender, auto&&) {
+    url.PointerExited([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
+        // The ☆ / ⋯ buttons drawn over the pill aren't in its tree, and opening their menu takes the
+        // pointer too: only a pointer actually outside the pill hides them.
+        if (InBounds(sender.try_as<mux::FrameworkElement>(), e)) return;
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st);
     });
@@ -5105,7 +5216,7 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     if (active && active == st.source.get()) return;  // already showing this pane's controls
     if (active && !FindByName(active, L"BackButton")) active = nullptr;  // its controls are elsewhere
     if (!active) {
-        if (auto addr = FindByName(url, L"AssistantBarHost"); addr && addr.Visibility() != mux::Visibility::Visible)
+        if (auto addr = ArcHost(st); addr && addr.Visibility() != mux::Visibility::Visible)
             addr.Visibility(mux::Visibility::Visible);  // Dia hides it on its start page; the pill stays
         return;
     }
@@ -5132,7 +5243,49 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     MoveInto(st, back, right, none, mux::HorizontalAlignment::Left);
     MoveInto(st, fwd, right, none, mux::HorizontalAlignment::Left);
     MoveInto(st, reload, right, none, mux::HorizontalAlignment::Left);
-    MoveInto(st, address, url, {0, 0, 0, 0}, mux::HorizontalAlignment::Stretch);
+    if (sidebar) {
+        st.address = winrt::make_weak(address);
+        st.addressTransform = address.RenderTransform();
+        st.addressMaxWidth = address.MaxWidth();
+        // Dia keeps the site's palette (hover and pressed fills, ...) in the toolbar's resources, which the
+        // field still inherits there: give it the app's own brushes for those keys, as the sidebar has.
+        for (mux::DependencyObject d = muxm::VisualTreeHelper::GetParent(address); d; d = muxm::VisualTreeHelper::GetParent(d)) {
+            auto fe = d.try_as<mux::FrameworkElement>();
+            if (!fe) continue;
+            for (auto const& kv : fe.Resources()) {
+                auto key = kv.Key().try_as<wf::IReference<winrt::hstring>>();
+                if (!key || !kv.Value().try_as<muxm::SolidColorBrush>() || key.Value() == L"NavigationBarBackgroundBrush") continue;
+                auto app = Resource(key.Value().c_str()).try_as<muxm::SolidColorBrush>();
+                if (!app || address.Resources().HasKey(kv.Key())) continue;
+                address.Resources().Insert(kv.Key(), app);
+                st.addressKeys.push_back(key.Value());
+            }
+            if (fe.Name() == L"NavigationBarHost") break;
+        }
+        // Theme resources only re-resolve on a theme change: flip it once so the brushes take.
+        address.RequestedTheme(mux::ElementTheme::Light);
+        address.RequestedTheme(mux::ElementTheme::Dark);
+        // Drawn over the pill, Dia's field takes the pill's clicks: open the command bar from it the same
+        // way (its ☆ / ⋯ buttons keep their own clicks). Only while it's the pill's field.
+        static thread_local std::set<void*> tapHooked;
+        if (tapHooked.insert(winrt::get_abi(address)).second)
+            address.AddHandler(mux::UIElement::TappedEvent(),
+                               winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const& sender,
+                                                                                    mux::Input::TappedRoutedEventArgs const& e) {
+                                   bool pill = false;
+                                   for (auto& [h, st] : t_arc)
+                                       if (st.address.get() == sender.try_as<mux::FrameworkElement>()) pill = true;
+                                   if (!pill || !ArcSidebarOn()) return;
+                                   for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d;
+                                        d = muxm::VisualTreeHelper::GetParent(d)) {
+                                       if (d.try_as<muxc::Primitives::ButtonBase>()) return;  // ☆ / ⋯
+                                       if (d == sender) break;
+                                   }
+                                   OpenCommandBar();
+                               })),
+                               true);
+    }
+    else MoveInto(st, address, url, {0, 0, 0, 0}, mux::HorizontalAlignment::Stretch);
     address.Visibility(mux::Visibility::Visible);
     st.source = winrt::make_weak(active);
     st.swapped = true;
@@ -5173,10 +5326,13 @@ static const double kCommandBarWidth = 600;
 static thread_local std::set<InstanceHandle> t_popoverHooked;
 
 static mux::FrameworkElement ArcPill(const mux::XamlRoot& root) {
-    for (auto& [h, st] : t_arc)
+    for (auto& [h, st] : t_arc) {
+        if (auto url = st.url.get().try_as<mux::FrameworkElement>(); url && st.address.get() && url.XamlRoot() == root)
+            return url;
         for (auto& m : st.moved)
             if (auto el = m.el.get().try_as<mux::FrameworkElement>(); el && el.Name() == L"AssistantBarHost" && el.XamlRoot() == root)
                 return el;
+    }
     return nullptr;
 }
 
@@ -7065,6 +7221,8 @@ static void OnRendering(wf::IInspectable const&, wf::IInspectable const&) {
         if (!a.gpu) ApplyOffset(a, h, false);
         any = true;
     }
+    for (auto& [h, st] : t_arc)
+        if (st.address.get()) FlushArcTrailing(st);
     if (!any) EnsureRendering(false);
 }
 
@@ -7140,7 +7298,11 @@ static void UpdateHiddenToolbar() {
         extern bool Tidy_Quiet();
         // Typing in the address bar (Ctrl+L) keeps it out; not while Tidy Tabs works its hidden chat (its
         // Chat button, in the toolbar, takes focus as the chat opens and gets it back as it closes).
-        bool focused = barEl && FocusWithin(barEl) && !Tidy_Quiet();
+        bool pillFocus = false;  // ☆ / ⋯ drawn in the sidebar are still in this toolbar
+        for (auto& [h, st] : t_arc)
+            if (auto address = st.address.get(); address && address.XamlRoot() == group.XamlRoot() && FocusWithin(address))
+                pillFocus = true;
+        bool focused = barEl && FocusWithin(barEl) && !pillFocus && !Tidy_Quiet();
         bool want = !hide || show || focused;
         double h = BarHeight(a);
         double target = want ? 0 : -h;
