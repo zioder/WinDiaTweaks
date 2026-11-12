@@ -4302,6 +4302,10 @@ static void ArcStyleHeader(ArcState& st) {
                 dy = top + 16 - (y + title.ActualHeight() / 2) - 0.6;  // capitals sit a bit below their line's middle
             } catch (...) {
             }
+        // The name's position is measured after layout rounding (whole pixels), so the result moves by up
+        // to a pixel with the shift we gave it last time: keep that shift unless it's a pixel or more off,
+        // or the name hops up and down a pixel on every pass.
+        if (std::abs(dy - c.Top) < 1.0) dy = c.Top;
         mux::Thickness m{(std::max)(0.0, contentStart - colStart), dy, (std::max)(0.0, colEnd - rightStart + 4), -dy};
         if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Right - m.Right) > 0.1 || std::abs(c.Top - m.Top) > 0.1)
             HeaderSet(st, host, mux::FrameworkElement::MarginProperty(), winrt::box_value(m));
@@ -5021,6 +5025,13 @@ static std::wstring SiteOf(std::wstring t) {
         t = t.substr(scheme + 3);
         t = t.substr(0, t.find_first_of(L"/?#"));
         if (size_t at = t.find(L'@'); at != std::wstring::npos) t = t.substr(at + 1);
+    } else if (t.find(L' ') == std::wstring::npos) {
+        // Some pages Dia shows as a bare address with no title ("google.com/?zx=123"): just the host too.
+        size_t cut = t.find_first_of(L"/?#");
+        if (cut != std::wstring::npos && cut > 0) {
+            std::wstring host = t.substr(0, cut);
+            if (host.find(L'.') != std::wstring::npos || host.rfind(L"localhost", 0) == 0) t = host;
+        }
     }
     if (t.rfind(L"www.", 0) == 0) t = t.substr(4);
     return t;
@@ -5313,6 +5324,9 @@ static void BuildArcWin(ArcWinBar& b, const muxc::Grid& group) {
 struct ArcWinHeader {
     winrt::weak_ref<muxc::Grid> header;        // Dia's WindowDragHeader
     winrt::weak_ref<muxc::StackPanel> panel;   // ours, after the logo: holds the toggle
+    // Dia's profile name (HeaderContentHost, with more than one profile), moved past the toggle: Dia's margin.
+    winrt::weak_ref<mux::FrameworkElement> name;
+    mux::Thickness nameMargin{};
 };
 static thread_local std::vector<ArcWinHeader> t_arcWinHeaders;
 
@@ -5320,6 +5334,8 @@ static void PutBackArcWinHeaders() {
     for (auto& s : t_arcWinHeaders) {
         auto header = s.header.get();
         auto panel = s.panel.get();
+        if (auto name = s.name.get()) name.Margin(s.nameMargin);
+        s.name = nullptr;
         if (!header || !panel) continue;
         uint32_t i;
         if (header.Children().IndexOf(panel, i)) header.Children().RemoveAt(i);
@@ -5358,6 +5374,24 @@ static void UpdateArcWinHeaders() {
         } catch (...) {
         }
         if (std::abs(panel.Margin().Left - x) > 0.5) panel.Margin({x, 0, 0, 0});
+        // With more than one profile Dia shows its name in the header's middle column, which starts
+        // where the toggle now sits: move the name past the toggle (as the Arc sidebar header does).
+        auto name = FindByName(header, L"HeaderContentHost");
+        if (name && s->name.get() != name) {
+            if (auto old = s->name.get()) old.Margin(s->nameMargin);
+            s->name = winrt::make_weak(name);
+            s->nameMargin = name.Margin();
+        }
+        if (name) {
+            double colStart = 0;
+            auto defs = header.ColumnDefinitions();
+            int col = muxc::Grid::GetColumn(name);
+            for (int i = 0; i < col && i < (int)defs.Size(); i++) colStart += defs.GetAt(i).ActualWidth();
+            double end = panel.Children().Size() && panel.ActualWidth() > 0 ? x + panel.ActualWidth() + 6 : 0;
+            auto m = s->nameMargin;
+            m.Left = (std::max)(m.Left, end - colStart);
+            if (std::abs(name.Margin().Left - m.Left) > 0.5) name.Margin(m);
+        }
     }
     t_arcWinHeaders.erase(std::remove_if(t_arcWinHeaders.begin(), t_arcWinHeaders.end(),
                                          [](const ArcWinHeader& x) { return !x.header.get() || !x.panel.get(); }),
@@ -5889,6 +5923,7 @@ void Ui_OpenInNewTab(const std::wstring& text) {
 static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     try {
         if (msg == WM_ARC_CTRL_T) {
+            Log("arc: Ctrl+T -> floating new tab bar");
             StartNewTabMode();
         } else if (msg == WM_ARC_ENTER) {
             // The hook went by a flag up to a tick old: focus left the box since, so give the Enter back.
@@ -5957,6 +5992,8 @@ static void SetArcKeys(bool on) {
     } else if (!g_arcHooks.Start(nullptr, ArcKeyHook)) {
         failed = true;
         Log("Arc keys: hook failed %lu", g_arcHooks.Error());
+    } else {
+        Log("Arc keys: hook on");
     }
 }
 
@@ -5964,6 +6001,65 @@ static void SetArcKeys(bool on) {
 static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
     g_arcEnterSubmits = t_newTabMode && !t_clearToken;  // (the box is focused: just checked)
+}
+
+// The sidebar's "+ New tab" button does what Ctrl+T does: with Floating New Tab on, the floating bar
+// (as in Arc, where the button and Ctrl+T are the same thing), not a New Tab page. It's Dia's unnamed
+// Button right in the tab list's RowsPanel (after the pinned / today / tab rows). Dia's own click is
+// stopped by taking the press's pointer capture away (a Button only clicks when the press it captured
+// ends on it), so no tab is made; the release then opens the bar. Checked on every press, so turning
+// the patch off gives the button back to Dia straight away. Keyboard (Space / Enter on it) stays Dia's.
+static thread_local std::vector<winrt::weak_ref<muxc::Button>> t_newTabButtons;
+static thread_local winrt::weak_ref<muxc::Button> t_newTabPress;
+
+static void HookSidebarNewTabButtons() {
+    if (!Engine_TweakOn(L"floatingNewTab")) return;
+    std::erase_if(t_newTabButtons, [](auto& w) { return !w.get(); });
+    for (auto h : FindNodes(L"RowsPanel")) {
+        auto rows = Obj<muxc::StackPanel>(h);
+        if (!rows) continue;
+        for (auto const& c : rows.Children()) {
+            auto btn = c.try_as<muxc::Button>();
+            if (!btn) continue;
+            bool known = false;
+            for (auto& w : t_newTabButtons)
+                if (w.get() == btn) known = true;
+            if (known) continue;
+            t_newTabButtons.push_back(winrt::make_weak(btn));
+            btn.AddHandler(
+                mux::UIElement::PointerPressedEvent(),
+                winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                    try {
+                        auto b = s.try_as<muxc::Button>();
+                        if (!b || !Engine_TweakOn(L"floatingNewTab")) return;
+                        if (!e.GetCurrentPoint(b).Properties().IsLeftButtonPressed()) return;
+                        b.ReleasePointerCaptures();  // no capture, no Click: Dia makes no tab
+                        e.Handled(true);
+                        t_newTabPress = winrt::make_weak(b);
+                    } catch (...) {
+                    }
+                })),
+                true);
+            btn.AddHandler(
+                mux::UIElement::PointerReleasedEvent(),
+                winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                    try {
+                        auto b = s.try_as<muxc::Button>();
+                        if (!b || t_newTabPress.get() != b) return;
+                        t_newTabPress = nullptr;
+                        if (!Engine_TweakOn(L"floatingNewTab")) return;
+                        auto p = e.GetCurrentPoint(b).Position();
+                        if (p.X < 0 || p.Y < 0 || p.X >= b.ActualWidth() || p.Y >= b.ActualHeight()) return;
+                        e.Handled(true);
+                        Log("arc: sidebar New tab -> floating new tab bar");
+                        StartNewTabMode();
+                    } catch (...) {
+                    }
+                })),
+                true);
+            Log("arc: sidebar New tab button hooked");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- window buttons (minimize/maximize/close)
@@ -6745,6 +6841,7 @@ bool Ui_Tick() {
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";
         UpdateNewTabMode();
+        if (tick % 4 == 0) HookSidebarNewTabButtons();
         stage = "peek";
         Peek_Tick();
         stage = "hoverCards";
