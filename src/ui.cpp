@@ -2084,9 +2084,11 @@ static void UpdateProfileEmoji() {
 // tabs, then eases open (0.2 s). Tidy asks Dia's chat to group the tabs (its GroupTabs tool makes,
 // names and colors the groups); meanwhile the line rolls as a wave, until the chat is done. Clear runs
 // Dia's own Close all tabs and confirms it.
-// Dia's own divider (TabSeparatorRow, "↓ Clear") only exists while Close All Tabs asks to confirm, so
-// the row is ours. It sits above Dia's TabListScrollViewer (moved down by the row's height), so it
-// stays put while the tabs scroll.
+// Without pinned tabs Dia's own divider (TabSeparatorRow, "↓ Clear") only exists while Close All Tabs
+// asks to confirm, so the row is ours. It sits above Dia's TabListScrollViewer (moved down by the row's
+// height), so it stays put while the tabs scroll. With pinned tabs Dia keeps its divider for good
+// between them and the other tabs, with its own "Clear Tabs" button: then the buttons go into that
+// divider instead, in place of Dia's Clear Tabs, and its line is the one that waves (see BuildTidySep).
 static bool DiaIsForeground();
 static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
                                      const std::function<bool(const mux::FrameworkElement&)>& want);
@@ -2110,7 +2112,7 @@ struct TidyRow {
     winrt::weak_ref<muxc::ScrollViewer> scroll;  // Dia's TabListScrollViewer
     winrt::weak_ref<muxc::Grid> root;            // Dia's RootGrid (holds the scroll viewer and our row)
     winrt::weak_ref<muxc::Grid> row;
-    winrt::weak_ref<muxsh::Rectangle> line;
+    winrt::weak_ref<mux::UIElement> line;  // ours, or (sep) Dia's divider line
     winrt::weak_ref<muxc::Canvas> waveBox;
     winrt::weak_ref<muxsh::Path> wave;
     winrt::weak_ref<muxc::Border> tidyBtn, clearBtn;
@@ -2127,6 +2129,11 @@ struct TidyRow {
     winrt::weak_ref<mux::FrameworkElement> stripHost;  // (strip) Dia's TabStripContentHost, narrowed to make room
     bool reserved = false;  // (strip) its margin narrowed (diaMargin holds Dia's)
     winrt::Windows::UI::Color stripColor{0xff, 0xff, 0xff, 0xff};  // (strip) the color of Dia's + (follows the bar)
+    bool sep = false;  // pinned tabs: the buttons sit in Dia's own divider below them (no row of ours)
+    winrt::weak_ref<muxc::Grid> sepGrid;            // (sep) Dia's TabSeparatorRow
+    winrt::weak_ref<muxc::Button> diaClear;         // (sep) Dia's Clear Tabs button, kept out of sight
+    wf::IInspectable diaClearMaxW{nullptr}, diaSepHit{nullptr};  // (sep) Dia's own values, put back on removal
+    int64_t sepHitToken = 0;                        // (sep) keeps the divider clickable
 };
 static thread_local std::vector<std::shared_ptr<TidyRow>> t_tidyRows;
 static thread_local winrt::event_token t_tidyFrame{};
@@ -2806,6 +2813,8 @@ static thread_local struct {
     POINT cursor{};
     bool cursorBack = true;
     std::weak_ptr<TidyRow> row;  // the line (or tab-strip icons) whose Clear was clicked: its window only
+    winrt::weak_ref<muxc::Grid> anchor;  // its RootGrid (outlives a divider's buttons, which go when Dia asks)
+    winrt::weak_ref<muxc::Grid> sepGrid;  // (pinned tabs) the divider whose Clear Tabs was pressed: only its own
 } t_clear;
 
 // Every tab row in the list (also those inside groups): Dia's row is a UserControl whose grid has five
@@ -2853,6 +2862,8 @@ static void EndClear(const char* why) {
     Log("clear: %s", why);
     t_clear.phase = 0;
     t_clear.row.reset();
+    t_clear.anchor = nullptr;
+    t_clear.sepGrid = nullptr;
 }
 
 static HWND TopWindowFor(const mux::XamlRoot& root);
@@ -2927,6 +2938,22 @@ static void StartClear(const std::shared_ptr<TidyRow>& rec) {
         Log("clear: closing the loose tabs (tabs on top)");
         return;
     }
+    if (rec->sep) {  // pinned tabs: Dia's own Clear Tabs (hidden behind ours) is pressed, as is
+        auto b = rec->diaClear.get();
+        try {
+            if (!b) throw winrt::hresult_error();
+            winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
+            t_clear.anchor = rec->root;
+            t_clear.sepGrid = rec->sepGrid;
+            t_clear.phase = 2;  // (should Dia ask to confirm after all, its "↓ Clear" is pressed too)
+            t_clear.at = GetTickCount64();
+            t_clear.cursorBack = true;
+            Log("clear: Dia's Clear Tabs pressed");
+            return;
+        } catch (...) {
+            Log("clear: Dia's Clear Tabs wouldn't run; trying Close All Tabs");
+        }
+    }
     POINT at;
     if (!EmptySidebarSpot(*rec, at)) return t_clear.row.reset(), Log("clear: no empty spot of the sidebar to right-click");
     GetCursorPos(&t_clear.cursor);
@@ -2950,8 +2977,8 @@ static void RunClear() {
     if (!t_clear.phase) return;
     ULONGLONG since = GetTickCount64() - t_clear.at;
     auto rec = t_clear.row.lock();
-    auto anchor = rec ? rec->root.get() : nullptr;
-    if (!rec || !anchor || !anchor.XamlRoot()) return EndClear("its window went away");
+    auto anchor = rec ? rec->root.get() : t_clear.anchor.get();
+    if (!anchor || !anchor.XamlRoot() || (!rec && t_clear.phase != 2)) return EndClear("its window went away");
     if (t_clear.phase == 3) {
         auto tab = NextLooseStripTab(rec->stripHost.get());
         if (!tab) return EndClear("done");
@@ -2989,15 +3016,17 @@ static void RunClear() {
         return;
     }
     // Dia's "↓ Clear" line: press it.
+    auto sepGrid = t_clear.sepGrid.get();
     for (auto h : FindNodes(L"CloseAllButton"))
         if (auto b = Obj<muxc::Button>(h); b && b.IsLoaded() && b.ActualWidth() > 0 && b.XamlRoot() == anchor.XamlRoot()) {
+            if (sepGrid && muxm::VisualTreeHelper::GetParent(b) != sepGrid) continue;
             try {
                 winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
                 return EndClear("done");
             } catch (...) {
             }
         }
-    if (since > 2000) EndClear("Dia's Clear line didn't show");
+    if (since > 2000) EndClear(sepGrid ? "done" : "Dia's Clear line didn't show");
 }
 
 // ---- the row
@@ -3013,6 +3042,28 @@ static void RemoveTidyRow(TidyRow& r) {
                 uint32_t i;
                 if (parent.Children().IndexOf(row, i)) parent.Children().RemoveAt(i);
             }
+    }
+    if (r.sep) {  // Dia's divider as it was: its line, its Clear Tabs, its hit testing
+        auto put = [](const mux::DependencyObject& o, const mux::DependencyProperty& dp, const wf::IInspectable& v) {
+            if (!v || v == mux::DependencyProperty::UnsetValue()) o.ClearValue(dp);
+            else o.SetValue(dp, v);
+        };
+        try {
+            if (auto box = r.waveBox.get())
+                if (auto parent = muxm::VisualTreeHelper::GetParent(box).try_as<muxc::Panel>()) {
+                    uint32_t i;
+                    if (parent.Children().IndexOf(box, i)) parent.Children().RemoveAt(i);
+                }
+            if (auto l = r.line.get()) l.Opacity(1);
+            if (auto b = r.diaClear.get()) put(b, mux::FrameworkElement::MaxWidthProperty(), r.diaClearMaxW);
+            if (auto g = r.sepGrid.get()) {
+                if (r.sepHitToken) g.UnregisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(), r.sepHitToken);
+                put(g, mux::UIElement::IsHitTestVisibleProperty(), r.diaSepHit);
+            }
+        } catch (...) {
+        }
+        r.sepHitToken = 0;
+        return;
     }
     if (auto sv = r.scroll.get()) sv.Margin(r.diaMargin);
     if (auto host = r.stripHost.get(); host && r.reserved) host.Margin(r.diaMargin);
@@ -3161,7 +3212,7 @@ static void SetTidyBusy(bool busy) {
         ShowWave(p, busy);
         if (p->strip) PulseBroom(*p, busy);
         StyleButtons(*p);
-        if (busy) p->target = 1, p->hideAt = 0;
+        if (busy) p->target = p->eligible ? 1 : 0, p->hideAt = 0;  // (a window with pinned tabs: its divider, not our row)
         else p->hideAt = GetTickCount64() + 1500;  // a moment to see it settle, then it follows the pointer again
     }
     EnsureTidyFrames();
@@ -3184,7 +3235,7 @@ static void CheckUnpark() {
 
 // Open when: busy, Show = Always (with tabs to act on), or hovered.
 static double TidyWant(const TidyRow& r, bool always) {
-    return (TidyBusy() || (r.eligible && (always || r.hovered))) ? 1 : 0;
+    return (r.eligible && (TidyBusy() || always || r.hovered)) ? 1 : 0;
 }
 
 static bool TidyAnimate() {
@@ -3218,7 +3269,7 @@ static bool TidyAnimate() {
             more = true;
         }
         double e = r.progress * r.progress * (3 - 2 * r.progress);
-        if (r.strip) {
+        if (r.strip || r.sep) {  // (sep: Dia's line makes room for the buttons, as for its own Clear Tabs)
             if (auto row = r.row.get()) {
                 if (std::abs(row.Opacity() - e) > 0.001) row.Opacity(e);
                 row.IsHitTestVisible(e > 0.5);
@@ -3273,6 +3324,14 @@ static bool InTidyZone(TidyRow& r, mux::Input::PointerRoutedEventArgs const& e) 
     auto root = r.root.get();
     if (!sv || !root) return false;
     auto pt = e.GetCurrentPoint(root).Position();
+    if (r.sep) {  // (pinned tabs) on Dia's divider, which scrolls with the tabs: while it's in view
+        auto g = r.sepGrid.get();
+        if (!g || !g.IsLoaded()) return false;
+        auto at = g.TransformToVisual(root).TransformPoint({0, 0});
+        auto svAt = sv.TransformToVisual(root).TransformPoint({0, 0});
+        if (pt.Y < svAt.Y || pt.Y > svAt.Y + sv.ActualHeight()) return false;
+        return pt.X >= svAt.X && pt.X <= svAt.X + sv.ActualWidth() && pt.Y >= at.Y - 4 && pt.Y <= at.Y + g.ActualHeight() + 4;
+    }
     auto top = sv.TransformToVisual(root).TransformPoint({0, 0});
     double rowTop = top.Y - (sv.Margin().Top - r.diaMargin.Top);
     double open = kTidyRowH * r.progress;
@@ -3333,6 +3392,71 @@ static muxc::Border TidyButton(const std::shared_ptr<TidyRow>& rec, bool isTidy,
     return b;
 }
 
+// The wave (shown over the line while Tidy works), in a box as wide as the line.
+static muxc::Canvas MakeWaveBox(const std::shared_ptr<TidyRow>& rec) {
+    std::weak_ptr<TidyRow> weak = rec;
+    auto box = muxc::Canvas();
+    box.Height(kWaveBox);
+    box.VerticalAlignment(mux::VerticalAlignment::Center);
+    box.Visibility(mux::Visibility::Collapsed);
+    auto wave = muxsh::Path();
+    wave.Stroke(BrushRes(L"TextFillColorTertiaryBrush", Rgba(255, 255, 255, 0x87)));
+    wave.StrokeThickness(1.25);
+    wave.StrokeStartLineCap(muxm::PenLineCap::Round), wave.StrokeEndLineCap(muxm::PenLineCap::Round);
+    box.Children().Append(wave);
+    {  // (animated on the compositor: smooth even while Dia's UI thread is busy)
+        using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
+        ElementCompositionPreview::SetIsTranslationEnabled(wave, true);
+        auto v = ElementCompositionPreview::GetElementVisual(wave);
+        v.CenterPoint({0, (float)(kWaveBox / 2), 0});
+        v.Scale({1, 0, 1});
+    }
+    box.SizeChanged([weak](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
+        auto p = weak.lock();
+        auto c = s.try_as<muxc::Canvas>();
+        if (!p || !c) return;
+        float w = e.NewSize().Width;
+        muxm::RectangleGeometry g;
+        g.Rect({0, 0, w, (float)kWaveBox});
+        c.Clip(g);
+        if (std::abs(w - p->waveW) > 1)
+            if (auto path = p->wave.get()) path.Data(WaveGeometry(w)), p->waveW = w;
+    });
+    rec->waveBox = winrt::make_weak(box);
+    rec->wave = winrt::make_weak(wave);
+    return box;
+}
+
+// Hover: open near the line, shut 150 ms after the pointer leaves (busy keeps it open).
+static void TrackTidyHover(const std::shared_ptr<TidyRow>& rec, const muxc::Grid& root) {
+    std::weak_ptr<TidyRow> weak = rec;
+    rec->moved = root.PointerMoved([weak](auto&&, mux::Input::PointerRoutedEventArgs const& e) {
+        auto p = weak.lock();
+        if (!p || !Engine_TweakOn(L"tidyTabs")) return;
+        bool in = InTidyZone(*p, e);
+        if (in == p->hovered) return;
+        p->hovered = in;
+        if (in && p->eligible) p->hideAt = 0, p->target = 1;
+        else if (!in && !p->hideAt) p->hideAt = GetTickCount64() + 150;
+        EnsureTidyFrames();
+    });
+    rec->exited = root.PointerExited([weak](auto&&, auto&&) {
+        auto p = weak.lock();
+        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 150, EnsureTidyFrames();
+    });
+}
+
+// The buttons, laid out for the options (our row's, or in Dia's divider).
+static muxc::StackPanel TidyButtons(const std::shared_ptr<TidyRow>& rec, const TidyLook& look) {
+    auto buttons = muxc::StackPanel();
+    buttons.Orientation(muxc::Orientation::Horizontal);
+    buttons.Spacing(look.text ? 6 : 2);
+    buttons.VerticalAlignment(mux::VerticalAlignment::Center);
+    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, look.text));
+    if (look.clear) buttons.Children().Append(TidyButton(rec, false, look.text));
+    return buttons;
+}
+
 static std::shared_ptr<TidyRow> BuildTidyRow(const muxc::ScrollViewer& sv, const muxc::Grid& root, const TidyLook& look) {
     auto rec = std::make_shared<TidyRow>();
     rec->scroll = winrt::make_weak(sv);
@@ -3371,70 +3495,99 @@ static std::shared_ptr<TidyRow> BuildTidyRow(const muxc::ScrollViewer& sv, const
     line.VerticalAlignment(mux::VerticalAlignment::Center);
     line.Fill(BrushRes(L"DividerStrokeColorDefaultBrush", Rgba(255, 255, 255, 0x1a)));
     lineArea.Children().Append(line);
-    auto box = muxc::Canvas();
-    box.Height(kWaveBox);
-    box.VerticalAlignment(mux::VerticalAlignment::Center);
-    box.Visibility(mux::Visibility::Collapsed);
-    auto wave = muxsh::Path();
-    wave.Stroke(BrushRes(L"TextFillColorTertiaryBrush", Rgba(255, 255, 255, 0x87)));
-    wave.StrokeThickness(1.25);
-    wave.StrokeStartLineCap(muxm::PenLineCap::Round), wave.StrokeEndLineCap(muxm::PenLineCap::Round);
-    box.Children().Append(wave);
-    {  // (animated on the compositor: smooth even while Dia's UI thread is busy)
-        using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
-        ElementCompositionPreview::SetIsTranslationEnabled(wave, true);
-        auto v = ElementCompositionPreview::GetElementVisual(wave);
-        v.CenterPoint({0, (float)(kWaveBox / 2), 0});
-        v.Scale({1, 0, 1});
-    }
-    box.SizeChanged([weak](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
-        auto p = weak.lock();
-        auto c = s.try_as<muxc::Canvas>();
-        if (!p || !c) return;
-        float w = e.NewSize().Width;
-        muxm::RectangleGeometry g;
-        g.Rect({0, 0, w, (float)kWaveBox});
-        c.Clip(g);
-        if (std::abs(w - p->waveW) > 1)
-            if (auto path = p->wave.get()) path.Data(WaveGeometry(w)), p->waveW = w;
-    });
-    lineArea.Children().Append(box);
+    lineArea.Children().Append(MakeWaveBox(rec));
     row.Children().Append(lineArea);
 
     // The buttons.
-    auto buttons = muxc::StackPanel();
-    buttons.Orientation(muxc::Orientation::Horizontal);
-    buttons.Spacing(look.text ? 6 : 2);
-    buttons.VerticalAlignment(mux::VerticalAlignment::Center);
+    auto buttons = TidyButtons(rec, look);
     buttons.Margin({0, 0, kTidyInset - 4, 0});
-    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, look.text));
-    if (look.clear) buttons.Children().Append(TidyButton(rec, false, look.text));
     muxc::Grid::SetColumn(buttons, 1);
     row.Children().Append(buttons);
 
     root.Children().Append(row);
     rec->row = winrt::make_weak(row);
-    rec->line = winrt::make_weak(line);
-    rec->waveBox = winrt::make_weak(box);
-    rec->wave = winrt::make_weak(wave);
+    rec->line = winrt::make_weak(mux::UIElement(line));
     StyleButtons(*rec);
-
-    // Hover: open near the top of the tabs, shut 150 ms after the pointer leaves (busy keeps it open).
-    rec->moved = root.PointerMoved([weak](auto&&, mux::Input::PointerRoutedEventArgs const& e) {
-        auto p = weak.lock();
-        if (!p || !Engine_TweakOn(L"tidyTabs")) return;
-        bool in = InTidyZone(*p, e);
-        if (in == p->hovered) return;
-        p->hovered = in;
-        if (in && p->eligible) p->hideAt = 0, p->target = 1;
-        else if (!in && !p->hideAt) p->hideAt = GetTickCount64() + 150;
-        EnsureTidyFrames();
-    });
-    rec->exited = root.PointerExited([weak](auto&&, auto&&) {
-        auto p = weak.lock();
-        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 150, EnsureTidyFrames();
-    });
+    TrackTidyHover(rec, root);
     Log("tidy: row added (%s)", N(rec->look).c_str());
+    return rec;
+}
+
+// Dia's divider in a state of its own (Close All Tabs asking to confirm: its "↓ Clear", an icon and
+// "Clear"), not the lasting one below pinned tabs ("Clear Tabs").
+static bool DiaSepAsking(const muxc::Grid& sep) {
+    auto b = FirstIn(sep, [](const mux::FrameworkElement& fe) { return fe.Name() == L"CloseAllButton"; });
+    if (!b) return false;
+    if (FirstIn(b, [](const mux::FrameworkElement& fe) { return (bool)fe.try_as<muxc::FontIcon>(); })) return true;
+    auto label = FirstIn(b, [](const mux::FrameworkElement& fe) { return (bool)fe.try_as<muxc::TextBlock>(); }).try_as<muxc::TextBlock>();
+    if (!label) return false;
+    std::wstring t;
+    for (wchar_t c : std::wstring_view(label.Text()))
+        if (!iswspace(c)) t += (wchar_t)towlower(c);
+    return t == L"clear";
+}
+
+// Dia's lasting divider below pinned tabs, in this tab list (it scrolls with the tabs), if it's shown.
+static muxc::Grid DiaPinnedSep(const muxc::ScrollViewer& sv) {
+    auto sep = FirstIn(sv, [](const mux::FrameworkElement& fe) {
+        return fe.Name() == L"TabSeparatorRow" && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0;
+    }).try_as<muxc::Grid>();
+    return sep && sep.IsLoaded() && sep.ColumnDefinitions().Size() >= 2 && !DiaSepAsking(sep) ? sep : nullptr;
+}
+
+// Pinned tabs: the buttons go into Dia's own divider below them, in the column of its Clear Tabs (kept
+// out of sight with MaxWidth 0, as Dia shows and hides it itself), and Dia's line is the one that waves.
+// The divider lets no clicks through as Dia has it; it's made clickable (its empty parts still aren't).
+static std::shared_ptr<TidyRow> BuildTidySep(const muxc::ScrollViewer& sv, const muxc::Grid& root, const muxc::Grid& sep,
+                                             const TidyLook& look) {
+    auto rec = std::make_shared<TidyRow>();
+    rec->sep = true;
+    rec->scroll = winrt::make_weak(sv);
+    rec->root = winrt::make_weak(root);
+    rec->sepGrid = winrt::make_weak(sep);
+    rec->look = look.key();
+    mux::FrameworkElement diaLine{nullptr};
+    for (auto const& c : sep.Children()) {
+        auto fe = c.try_as<mux::FrameworkElement>();
+        if (!fe) continue;
+        if (fe.Name() == L"CloseAllButton") {
+            if (auto b = fe.try_as<muxc::Button>()) {
+                rec->diaClear = winrt::make_weak(b);
+                rec->diaClearMaxW = b.ReadLocalValue(mux::FrameworkElement::MaxWidthProperty());
+                b.MaxWidth(0);
+            }
+        } else if (!diaLine && fe.try_as<muxc::Border>() && muxc::Grid::GetColumn(fe) == 0)
+            diaLine = fe;
+    }
+    if (diaLine) {  // the wave, over Dia's line (and as wide)
+        auto box = MakeWaveBox(rec);
+        muxc::Grid::SetColumn(box, 0);
+        muxc::Grid::SetColumnSpan(box, muxc::Grid::GetColumnSpan(diaLine));
+        box.Margin(diaLine.Margin());
+        box.IsHitTestVisible(false);
+        sep.Children().Append(box);
+        rec->line = winrt::make_weak(mux::UIElement(diaLine));
+    }
+    auto row = muxc::Grid();
+    row.Name(L"diatweaksTidySep");
+    row.Opacity(0);
+    row.Visibility(mux::Visibility::Collapsed);
+    row.VerticalAlignment(mux::VerticalAlignment::Center);
+    row.Margin({kTidyGap, 0, 0, 0});
+    muxc::Grid::SetColumn(row, 1);
+    row.Children().Append(TidyButtons(rec, look));
+    sep.Children().Append(row);
+    rec->row = winrt::make_weak(row);
+    rec->diaSepHit = sep.ReadLocalValue(mux::UIElement::IsHitTestVisibleProperty());
+    sep.IsHitTestVisible(true);
+    rec->sepHitToken = sep.RegisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(),
+                                                           [](mux::DependencyObject const& o, mux::DependencyProperty const&) {
+                                                               if (auto g = o.try_as<mux::UIElement>(); g && !g.IsHitTestVisible())
+                                                                   g.IsHitTestVisible(true);
+                                                           });
+    StyleButtons(*rec);
+    TrackTidyHover(rec, root);
+    Log("tidy: buttons put in Dia's divider (%s)", N(rec->look).c_str());
     return rec;
 }
 
@@ -3547,6 +3700,11 @@ static void UpdateTidyTabs() {
         auto host = r.root.get();
         auto sh = r.stripHost.get();
         bool gone = r.strip ? (!sh || !sh.IsLoaded() || sh.ActualWidth() <= 0) : !r.scroll.get();
+        if (r.sep && !gone) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
+            auto g = r.sepGrid.get();
+            gone = !g || DiaPinnedSep(r.scroll.get()) != g;
+            if (g && !gone && !g.IsHitTestVisible()) g.IsHitTestVisible(true);
+        }
         bool stale = gone || !r.row.get() || !host || (r.look != (r.strip ? StripLook(look) : look.key()) && !TidyBusy());
         if (!on || stale) {
             RemoveTidyRow(r);
@@ -3555,25 +3713,40 @@ static void UpdateTidyTabs() {
             ++it;
     }
     if (!on) return;
-    // Dia's own divider is up (Close All Tabs is asking): ours shuts.
+    // Dia's own divider is up asking to confirm Close All Tabs: ours shuts. (The lasting one below pinned
+    // tabs takes the buttons instead: see BuildTidySep.)
     bool diaLine = false;
     for (auto h : FindNodes(L"TabSeparatorRow"))
-        if (auto fe = Obj<mux::FrameworkElement>(h); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0)
+        if (auto fe = Obj<muxc::Grid>(h); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0 && DiaSepAsking(fe))
             diaLine = true;
     for (auto h : FindNodes(L"TabListScrollViewer")) {
         auto sv = Obj<muxc::ScrollViewer>(h);
         auto root = sv ? muxm::VisualTreeHelper::GetParent(sv).try_as<muxc::Grid>() : nullptr;
         if (!root || root.Name() != L"RootGrid") continue;
-        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->scroll.get() == sv; });
+        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return !p->sep && p->scroll.get() == sv; });
         if (it == t_tidyRows.end()) {
             t_tidyRows.push_back(BuildTidyRow(sv, root, look));
             it = std::prev(t_tidyRows.end());
         }
         auto& r = **it;
+        // Pinned tabs: the buttons are in Dia's divider below them, and our row stays shut.
+        auto sep = DiaPinnedSep(sv);
         // Any tabs in the list, loose or in groups (Clear and a new Tidy both apply to grouped tabs too).
-        r.eligible = !diaLine && (TabsBelow(sv) > 0 || !AllTabRows().empty());
+        bool tabs = TabsBelow(sv) > 0 || !AllTabRows().empty();
+        r.eligible = !diaLine && !sep && tabs;
         double want = TidyWant(r, look.always);
         if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
+        if (!sep) continue;
+        auto si = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->sep && p->sepGrid.get() == sep; });
+        if (si == t_tidyRows.end()) {
+            t_tidyRows.push_back(BuildTidySep(sv, root, sep, look));
+            si = std::prev(t_tidyRows.end());
+            if (TidyBusy()) ShowWave(*si, true), (*si)->target = 1;
+        }
+        auto& s = **si;
+        s.eligible = !diaLine && tabs;
+        double sw = TidyWant(s, look.always);
+        if (sw != s.target && !s.hideAt) s.target = sw, EnsureTidyFrames();
     }
     for (auto h : FindNodes(L"TabStripContentHost")) {
         auto host = Obj<muxc::Grid>(h);
