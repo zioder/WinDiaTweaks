@@ -690,13 +690,14 @@ static void ApplyPreset(const std::wstring& preset) {
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
-                                               L"peek",           L"tidyTabs",            L"mediaControls"};
+                                               L"peek",           L"tidyTabs",            L"mediaControls",
+                                               L"arcPinnedTabs"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
     // the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs",         L"mediaControls"};
+                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -3908,6 +3909,370 @@ static void ScheduleHoverCards() {
         } catch (...) {
         }
     });
+}
+
+// ---------------------------------------------------------------- Arc pinned tabs
+// Like Arc's pinned tabs: on hover, a pinned tab that has gone somewhere else shows "–" at its right
+// end, which takes it back to its pinned page (Dia's own "Back to Pinned URL"); one still on its page
+// shows ✕, Dia's own Close tab (which Dia leaves off pinned tabs outside folders, and which removes
+// the pinned tab, as its menu's Close does). A tab is pinned when its row is above Dia's
+// TabSeparatorRow (the line with Clear) in the sidebar's list. Dia's row is a UserControl whose grid
+// has five columns, its ✕ ("Close tab") in the last; "Back to Pinned URL" is a button Dia adds over
+// the icon while the tab is away from its pinned page.
+// Nothing is added to Dia's row (Dia adds and removes its own buttons there, and a stranger among
+// them broke Back to Pinned URL and then Dia): the – / ✕ is a button in a popup laid over the row's
+// right end, and its click presses Dia's own button. Under it Dia's ✕ is kept laid out (invisible,
+// not clickable) so the title fades out before it, as on any hovered tab.
+
+struct PinnedRow {
+    winrt::weak_ref<muxc::UserControl> row;
+    winrt::weak_ref<muxc::Grid> grid;
+    winrt::event_token entered{}, exited{}, canceled{};
+    bool pinned = false, inFolder = false;
+};
+static thread_local std::vector<PinnedRow> t_pinnedRows;
+
+static thread_local struct {
+    muxc::Primitives::Popup popup{nullptr};
+    muxc::Button button{nullptr};
+    muxc::FontIcon icon{nullptr};
+    winrt::weak_ref<muxc::Grid> grid;      // the row it's over
+    // Dia's ✕ on that row, held in the layout but invisible while ours is over it: its column then
+    // takes the room it takes on any hovered tab, so the title stops short of our button.
+    winrt::weak_ref<muxc::Button> held;
+    mux::Visibility heldVisibility = mux::Visibility::Collapsed;
+    int64_t heldToken = 0;
+    bool away = false;                     // showing – (else ✕)
+    bool overRow = false, overButton = false;
+    winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{nullptr};
+} t_pin;
+
+static muxc::Button RowButton(const muxc::Grid& g, const wchar_t* name, bool visibleOnly) {
+    for (auto const& c : g.Children())
+        if (auto b = c.try_as<muxc::Button>()) {
+            if (visibleOnly && b.Visibility() != mux::Visibility::Visible) continue;
+            if (winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(b) == name) return b;
+        }
+    return nullptr;
+}
+
+static PinnedRow* PinnedRowFor(const muxc::Grid& g) {
+    for (auto& r : t_pinnedRows)
+        if (g && r.grid.get() == g) return &r;
+    return nullptr;
+}
+
+static void ReleaseDiaClose() {
+    if (auto c = t_pin.held.get()) {
+        c.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), t_pin.heldToken);
+        c.Opacity(1), c.IsHitTestVisible(true);
+        c.Visibility(t_pin.heldVisibility);
+    }
+    t_pin.held = nullptr;
+    t_pin.heldToken = 0;
+}
+
+static void HoldDiaClose(const muxc::Button& close) {
+    if (t_pin.held.get() == close) return;
+    ReleaseDiaClose();
+    t_pin.heldVisibility = close.Visibility();
+    close.Opacity(0), close.IsHitTestVisible(false);
+    close.Visibility(mux::Visibility::Visible);
+    t_pin.held = winrt::make_weak(close);
+    // Dia collapses it again when its own hover ends (or never shows it, on pinned tabs): keep it laid out.
+    t_pin.heldToken = close.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), [](auto const& sender, auto&&) {
+        if (auto c = sender.template try_as<muxc::Button>(); c && t_pin.held.get() == c && c.Visibility() != mux::Visibility::Visible)
+            c.Visibility(mux::Visibility::Visible);
+    });
+}
+
+static void HidePinButton() {
+    ReleaseDiaClose();
+    if (t_pin.popup && t_pin.popup.IsOpen()) t_pin.popup.IsOpen(false);
+    t_pin.grid = nullptr;
+    t_pin.overRow = t_pin.overButton = false;
+}
+
+static void PressPinButton() {
+    auto g = t_pin.grid.get();
+    bool away = t_pin.away;
+    HidePinButton();
+    if (!g) return;
+    // What it showed when clicked: – only ever goes back (never closes, which removes a pinned tab).
+    if (away) {
+        if (auto back = RowButton(g, L"Back to Pinned URL", false)) PressButton(back, "back to pinned");
+    } else {
+        PressButton(RowButton(g, L"Close tab", false), "close pinned");
+    }
+}
+
+static void MakePinButton() {
+    if (t_pin.popup) return;
+    t_pin.icon = muxc::FontIcon();
+    t_pin.icon.FontSize(10);
+    t_pin.button = muxc::Button();
+    t_pin.button.Name(L"diatweaksPinnedButton");
+    t_pin.button.Content(t_pin.icon);
+    t_pin.button.Click([](auto&&, auto&&) {
+        try {
+            PressPinButton();
+        } catch (...) {
+        }
+    });
+    t_pin.button.PointerEntered([](auto&&, auto&&) { t_pin.overButton = true; });
+    t_pin.button.PointerExited([](auto&&, auto&&) {
+        t_pin.overButton = false;
+        if (t_pin.timer) t_pin.timer.Start();
+    });
+    t_pin.popup = muxc::Primitives::Popup();
+    t_pin.popup.ShouldConstrainToRootBounds(false);
+    t_pin.popup.Child(t_pin.button);
+    // Leaving the row for the button (or back) fires a leave before the enter: decide a moment later.
+    t_pin.timer = t_pin.button.DispatcherQueue().CreateTimer();
+    t_pin.timer.Interval(std::chrono::milliseconds(80));
+    t_pin.timer.IsRepeating(false);
+    t_pin.timer.Tick([](auto&&, auto&&) {
+        try {
+            if (!t_pin.overRow && !t_pin.overButton) HidePinButton();
+        } catch (...) {
+        }
+    });
+}
+
+// Dia's ✕ look, set on the button itself (Dia's style doesn't reach into a popup): no fill until the
+// pointer is on it, a faint square then, the glyph in the sidebar's text color.
+static void StylePinButton(bool dark) {
+    static thread_local int styled = -1;
+    if (styled == (int)dark) return;
+    styled = dark;
+    auto& b = t_pin.button;
+    auto brush = [](uint8_t a, uint8_t v) { return muxm::SolidColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(a, v, v, v)); };
+    uint8_t ink = dark ? 255 : 0;
+    auto res = b.Resources();
+    auto put = [&](const wchar_t* key, const muxm::SolidColorBrush& v) { res.Insert(winrt::box_value(key), v); };
+    put(L"ButtonBackground", brush(0, ink));
+    put(L"ButtonBackgroundPointerOver", brush(dark ? 0x26 : 0x14, ink));
+    put(L"ButtonBackgroundPressed", brush(dark ? 0x1a : 0x0e, ink));
+    put(L"ButtonBorderBrush", brush(0, ink));
+    put(L"ButtonBorderBrushPointerOver", brush(0, ink));
+    put(L"ButtonBorderBrushPressed", brush(0, ink));
+    put(L"ButtonForeground", brush(dark ? 0xcc : 0xb3, ink));
+    put(L"ButtonForegroundPointerOver", brush(0xff, ink));
+    put(L"ButtonForegroundPressed", brush(dark ? 0xb3 : 0x99, ink));
+    b.Background(brush(0, ink));
+    b.BorderThickness({0, 0, 0, 0});
+    b.Padding({0, 0, 0, 0});
+    b.CornerRadius({4, 4, 4, 4});
+    b.MinWidth(0), b.MinHeight(0);
+    b.HorizontalContentAlignment(mux::HorizontalAlignment::Center);
+    b.VerticalContentAlignment(mux::VerticalAlignment::Center);
+    b.RequestedTheme(dark ? mux::ElementTheme::Dark : mux::ElementTheme::Light);
+    t_pin.icon.FontFamily(muxm::FontFamily(L"Segoe Fluent Icons, Segoe MDL2 Assets"));
+}
+
+// Shows (or moves) the – / ✕ over this row's right end, where Dia's own ✕ goes. False: not for this row.
+static bool PlacePinButton(const PinnedRow& r) {
+    auto g = r.grid.get();
+    auto row = r.row.get();
+    if (!g || !row || !row.IsLoaded() || !r.pinned || g.ActualWidth() <= 0 || !g.XamlRoot()) return false;
+    auto close = RowButton(g, L"Close tab", false);
+    if (!close) return false;
+    bool away = RowButton(g, L"Back to Pinned URL", true) != nullptr;
+    if (!away && r.inFolder) return false;  // (Dia shows its own ✕ there)
+    MakePinButton();
+    t_pin.grid = winrt::make_weak(g);
+    bool wasHeld = t_pin.held.get() == close;
+    HoldDiaClose(close);
+    if (!wasHeld) g.UpdateLayout();  // (its column now has its width: place ours on it)
+    auto& b = t_pin.button;
+    double w = close.ActualWidth() > 0 ? close.ActualWidth() : 22, h = close.ActualHeight() > 0 ? close.ActualHeight() : 22;
+    if (b.Width() != w) b.Width(w), b.Height(h);
+    StylePinButton(g.ActualTheme() != mux::ElementTheme::Light);
+    winrt::hstring glyph = away ? L"" : L"";  // Remove (–) / Cancel (✕, as Dia's)
+    if (t_pin.icon.Glyph() != glyph) {
+        t_pin.icon.Glyph(glyph);
+        const wchar_t* label = away ? L"Back to Pinned URL" : L"Close tab";
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, label);
+        muxc::ToolTipService::SetToolTip(b, winrt::box_value(label));
+    }
+    t_pin.away = away;
+    // Right on Dia's (invisible) ✕; before it's laid out, the grid's right end inside padding and margin.
+    double x, y;
+    if (close.ActualWidth() > 0) {
+        auto c = close.TransformToVisual(nullptr).TransformPoint({0, 0});
+        x = c.X, y = c.Y;
+    } else {
+        auto o = g.TransformToVisual(nullptr).TransformPoint({0, 0});
+        x = o.X + g.ActualWidth() - g.Padding().Right - close.Margin().Right - w;
+        y = o.Y + (g.ActualHeight() - h) / 2;
+    }
+    auto& p = t_pin.popup;
+    if (p.XamlRoot() != g.XamlRoot()) p.IsOpen(false), p.XamlRoot(g.XamlRoot());
+    if (std::abs(p.HorizontalOffset() - x) > 0.5) p.HorizontalOffset(x);
+    if (std::abs(p.VerticalOffset() - y) > 0.5) p.VerticalOffset(y);
+    if (!p.IsOpen()) p.IsOpen(true);
+    return true;
+}
+
+static void PinnedRowHover(const winrt::weak_ref<muxc::Grid>& wg, bool on) {
+    auto g = wg.get();
+    auto r = PinnedRowFor(g);
+    if (!r) return;
+    if (on) {
+        t_pin.overRow = PlacePinButton(*r);
+        if (!t_pin.overRow && t_pin.grid.get() == g) HidePinButton();
+    } else if (t_pin.grid.get() == g) {
+        t_pin.overRow = false;
+        if (t_pin.timer) t_pin.timer.Start();
+    }
+}
+
+static void ForgetPinnedRow(PinnedRow& r) {
+    if (auto row = r.row.get()) {
+        row.PointerEntered(r.entered);
+        row.PointerExited(r.exited);
+        row.PointerCanceled(r.canceled);
+    }
+}
+
+static void AdoptPinnedRow(const muxc::UserControl& row, const muxc::Grid& g) {
+    PinnedRow r;
+    r.row = winrt::make_weak(row);
+    r.grid = winrt::make_weak(g);
+    auto wg = r.grid;
+    r.entered = row.PointerEntered([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, true);
+        } catch (...) {
+        }
+    });
+    r.exited = row.PointerExited([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, false);
+        } catch (...) {
+        }
+    });
+    r.canceled = row.PointerCanceled([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, false);
+        } catch (...) {
+        }
+    });
+    t_pinnedRows.push_back(std::move(r));
+}
+
+// --- And Dia's own "away from its pinned page" look goes, for Arc's: no "/" after the icon (the Path in
+// Dia's Back to Pinned URL button, which also widens the icon column from 16 to 28) and no "Back to
+// Pinned URL" line under the title on hover. Only properties change: the button stays (invisible, not
+// clickable, no width), so Dia still knows the tab is away and the – above still presses it.
+struct PinnedMark {
+    winrt::weak_ref<muxc::Button> back;
+    double opacity = 1, width = 0;
+    winrt::weak_ref<mux::FrameworkElement> subtitle;
+    mux::Visibility subtitleVisibility = mux::Visibility::Collapsed;
+    int64_t subtitleToken = 0;
+};
+static thread_local std::vector<PinnedMark> t_pinnedMarks;
+
+static void RestorePinnedMark(PinnedMark& m) {
+    if (auto b = m.back.get()) b.Opacity(m.opacity), b.IsHitTestVisible(true), b.Width(m.width);
+    if (auto s = m.subtitle.get()) {
+        s.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), m.subtitleToken);
+        s.Visibility(m.subtitleVisibility);
+    }
+}
+
+static void UpdatePinnedMarks() {
+    if (!Engine_TweakOn(L"arcPinnedTabs")) {
+        for (auto& m : t_pinnedMarks) RestorePinnedMark(m);
+        t_pinnedMarks.clear();
+        return;
+    }
+    std::erase_if(t_pinnedMarks, [](PinnedMark& m) {
+        auto b = m.back.get();
+        if (b && b.IsLoaded()) return false;
+        RestorePinnedMark(m);
+        return true;
+    });
+    for (auto& row : AllTabRows()) {
+        auto g = row.as<muxc::UserControl>().Content().try_as<muxc::Grid>();
+        auto back = g ? RowButton(g, L"Back to Pinned URL", false) : nullptr;
+        if (!back) continue;
+        if (std::any_of(t_pinnedMarks.begin(), t_pinnedMarks.end(), [&](PinnedMark& m) { return m.back.get() == back; })) {
+            if (back.Opacity() != 0) back.Opacity(0);  // (in case Dia animated it back)
+            if (back.Width() != 0) back.Width(0);
+            continue;
+        }
+        PinnedMark m;
+        m.back = winrt::make_weak(back);
+        m.opacity = back.Opacity();
+        m.width = back.Width();
+        back.Opacity(0), back.IsHitTestVisible(false), back.Width(0);
+        // The line under the title: the grid in the title's stack that holds "Back to Pinned URL".
+        for (auto const& c : g.Children()) {
+            auto stack = c.try_as<muxc::StackPanel>();
+            if (!stack) continue;
+            for (auto const& line : stack.Children()) {
+                auto fe = line.try_as<mux::FrameworkElement>();
+                if (!fe || !FirstIn(fe, [](const mux::FrameworkElement& e) {
+                        auto t = e.try_as<muxc::TextBlock>();
+                        return t && t.Text() == L"Back to Pinned URL";
+                    }))
+                    continue;
+                m.subtitle = winrt::make_weak(fe);
+                m.subtitleVisibility = fe.Visibility();
+                fe.Visibility(mux::Visibility::Collapsed);
+                m.subtitleToken = fe.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), [](auto const& sender, auto&&) {
+                    if (auto e = sender.template try_as<mux::FrameworkElement>(); e && e.Visibility() != mux::Visibility::Collapsed)
+                        e.Visibility(mux::Visibility::Collapsed);
+                });
+            }
+        }
+        t_pinnedMarks.push_back(std::move(m));
+    }
+}
+
+static void UpdatePinnedTabs() {
+    if (!Engine_TweakOn(L"arcPinnedTabs")) {
+        if (t_pin.popup) HidePinButton();
+        for (auto& r : t_pinnedRows) ForgetPinnedRow(r);
+        t_pinnedRows.clear();
+        return;
+    }
+    std::erase_if(t_pinnedRows, [](PinnedRow& r) {  // rows that left the tree
+        auto row = r.row.get();
+        if (row && row.IsLoaded()) return false;
+        ForgetPinnedRow(r);
+        return true;
+    });
+    for (auto& r : t_pinnedRows) r.pinned = false;
+    for (auto h : FindNodes(L"TabSeparatorRow")) {
+        auto sep = Obj<mux::FrameworkElement>(h);
+        auto list = sep ? muxm::VisualTreeHelper::GetParent(sep).try_as<muxc::StackPanel>() : nullptr;
+        if (!list || list.ActualHeight() <= 0) continue;
+        for (auto const& child : list.Children()) {
+            if (child == sep) break;
+            auto top = child.try_as<mux::FrameworkElement>();
+            if (!top) continue;
+            FirstIn(top, [&](const mux::FrameworkElement& fe) {
+                auto uc = fe.try_as<muxc::UserControl>();
+                auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+                if (!g || g.ColumnDefinitions().Size() != 5) return false;
+                bool inFolder = false;  // (another RowsPanel between the row and the list)
+                for (auto p = muxm::VisualTreeHelper::GetParent(fe); p && p != list; p = muxm::VisualTreeHelper::GetParent(p))
+                    if (auto pe = p.try_as<mux::FrameworkElement>(); pe && pe.Name() == L"RowsPanel") inFolder = true;
+                auto r = PinnedRowFor(g);
+                if (!r) AdoptPinnedRow(uc, g), r = PinnedRowFor(g);
+                if (r) r->pinned = true, r->inFolder = inFolder;
+                return false;
+            });
+        }
+    }
+    // Keep the shown button in step: the row scrolled, went back to its page, or stopped being pinned.
+    if (t_pin.popup && t_pin.popup.IsOpen()) {
+        auto r = PinnedRowFor(t_pin.grid.get());
+        if (!r || !PlacePinButton(*r)) HidePinButton();
+    }
 }
 
 // ---------------------------------------------------------------- Clean search box
@@ -7158,6 +7523,7 @@ bool Ui_Tick() {
         Peek_Tick();
         stage = "hoverCards";
         UpdateHoverCards();
+        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks();
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
