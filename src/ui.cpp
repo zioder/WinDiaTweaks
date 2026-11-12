@@ -6012,6 +6012,61 @@ static void UpdateNewTabMode() {
 static thread_local std::vector<winrt::weak_ref<muxc::Button>> t_newTabButtons;
 static thread_local winrt::weak_ref<muxc::Button> t_newTabPress;
 
+// Arc modes: the window moves only from the top, as in Arc. Dia also moves it when you drag empty space
+// in the sidebar (its header row included), by moving the window itself on each pointer move (laggy,
+// the window trails the pointer). That starts from a press Dia handles at the sidebar's border or above
+// it; a press on empty space reaches there unhandled. Marked handled lower down, in the space pages'
+// scroll viewer, Dia's handler never sees it. The header row's gaps (logo, toggle, name, ← → ↻) are
+// registered as caption areas instead (ArcWinDragRects), so there Windows itself moves the window, as on
+// a title bar: smooth, with snapping. Presses on tabs, buttons, boxes (anything with a press of its own)
+// go through.
+static thread_local std::set<void*> t_noDragSidebars;
+
+// 0: not empty space (a tab, button, box...), 1: empty sidebar space, 2: empty space in the header row.
+// (The header's gaps have no background: a press there lands on the space pages' own grid, so the row
+// is found by where the press is, not by what was hit.)
+static int PressOnEmptySidebar(const mux::DependencyObject& source, const mux::UIElement& sv,
+                               mux::Input::PointerRoutedEventArgs const& e) {
+    for (auto d = source; d && d != sv; d = muxm::VisualTreeHelper::GetParent(d))
+        if (d.try_as<muxc::Primitives::ButtonBase>() || d.try_as<muxc::UserControl>() || d.try_as<muxc::TextBox>() ||
+            d.try_as<muxc::RichEditBox>() || d.try_as<muxc::Primitives::ScrollBar>() || d.try_as<muxc::Primitives::Thumb>())
+            return 0;
+    int kind = 1;
+    FirstIn(sv, [&](const mux::FrameworkElement& fe) {
+        if (fe.Name() != L"WindowDragHeader" || !ShownOnScreen(fe)) return false;
+        auto p = e.GetCurrentPoint(fe).Position();
+        if (p.X >= 0 && p.Y >= 0 && p.X < fe.ActualWidth() && p.Y < fe.ActualHeight()) kind = 2;
+        return kind == 2;
+    });
+    return kind;
+}
+
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+static void UpdateSidebarNoDrag() {
+    if (!ArcSidebarOn() && !ArcWindowsOn()) return;  // (checked again on each press: off gives Dia its drag back)
+    for (auto h : FindNodes(L"SpacesScrollViewer")) {
+        auto sv = Obj<mux::UIElement>(h);
+        if (!sv || !t_noDragSidebars.insert(winrt::get_abi(sv)).second) continue;
+        sv.AddHandler(
+            mux::UIElement::PointerPressedEvent(),
+            winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    if (e.Handled() || (!ArcSidebarOn() && !ArcWindowsOn())) return;
+                    auto sv = s.try_as<mux::UIElement>();
+                    if (!sv || !e.GetCurrentPoint(sv).Properties().IsLeftButtonPressed()) return;
+                    auto src = e.OriginalSource().try_as<mux::DependencyObject>();
+                    int kind = src ? PressOnEmptySidebar(src, sv, e) : 0;
+                    if (!kind) return;
+                    e.Handled(true);
+                } catch (...) {
+                }
+            })),
+            true);
+        Log("arc: sidebar no longer drags the window");
+    }
+}
+
 static void HookSidebarNewTabButtons() {
     if (!Engine_TweakOn(L"floatingNewTab")) return;
     std::erase_if(t_newTabButtons, [](auto& w) { return !w.get(); });
@@ -6093,8 +6148,8 @@ void ProbeRegions(std::ostringstream& o) {
     for (auto& [h, c] : t_caption) {
         if (!c.src) continue;
         o << "pageLeft=" << c.pageLeft << " trimmed=" << c.captionTrimmed << "\n";
-        const char* names[] = {"Caption", "Close", "Maximize", "Minimize", "Icon", "TopBorder", "LeftBorder",
-                               "BottomBorder", "RightBorder", "Passthrough"};
+        const char* names[] = {"Close", "Maximize", "Minimize", "Icon", "Caption", "TopBorder", "LeftBorder",
+                               "BottomBorder", "RightBorder", "Passthrough"};  // (NonClientRegionKind's order)
         for (int k = 0; k <= 9; k++) {
             auto rects = c.src.GetRegionRects((mui::NonClientRegionKind)k);
             if (!rects.size()) continue;
@@ -6619,12 +6674,40 @@ static HWND TopWindowFor(const mux::XamlRoot& root) {
 
 HWND Ui_TopWindowFor(const mux::XamlRoot& root) { return TopWindowFor(root); }  // (media.cpp)
 
-// The strip's empty space, in window pixels: the strip minus its left buttons, the centered group and
-// its right buttons. That's what drags the window, as in Arc's title bar.
+// The empty space that drags the window, in window pixels, as in Arc's title bar: in Arc (Windows) the
+// strip minus its left buttons, the centered group and its right buttons; in both Arc modes the sidebar's
+// header row (logo, toggle, name, ← → ↻) minus its buttons and the name.
 static std::vector<winrt::Windows::Graphics::RectInt32> ArcWinDragRects(const mux::XamlRoot& root) {
     std::vector<winrt::Windows::Graphics::RectInt32> out;
-    if (!ArcWindowsOn() || !root) return out;
+    if (!root || (!ArcWindowsOn() && !ArcSidebarOn())) return out;
     double sc = root.RasterizationScale();
+    for (auto h : FindNodes(L"WindowDragHeader")) {
+        auto header = Obj<mux::FrameworkElement>(h);
+        if (!header || header.XamlRoot() != root || !ShownOnScreen(header) || header.ActualWidth() <= 0) continue;
+        auto at = header.TransformToVisual(nullptr).TransformPoint({0, 0});
+        if (at.X + header.ActualWidth() <= 0 || at.Y + header.ActualHeight() <= 0) continue;
+        std::vector<std::pair<double, double>> taken;
+        FirstIn(header, [&](const mux::FrameworkElement& fe) {
+            bool hit = fe.try_as<muxc::Primitives::ButtonBase>() || fe.Name() == L"TitleTextPresenter";
+            if (hit && fe.Visibility() == mux::Visibility::Visible && fe.ActualWidth() > 0 && ShownOnScreen(fe)) {
+                double x = fe.TransformToVisual(nullptr).TransformPoint({0, 0}).X;
+                taken.push_back({x - 2, x + fe.ActualWidth() + 2});
+            }
+            return false;
+        });
+        std::sort(taken.begin(), taken.end());
+        double x = at.X, end = at.X + header.ActualWidth(), top = (std::max)(0.0, (double)at.Y), bottom = at.Y + header.ActualHeight();
+        auto add = [&](double l, double r) {
+            if (r - l < 4) return;
+            out.push_back({(int)std::ceil(l * sc), (int)std::floor(top * sc), (int)std::floor((r - l) * sc), (int)std::floor((bottom - top) * sc)});
+        };
+        for (auto& [l, r] : taken) {
+            if (l > x) add(x, (std::min)(l, end));
+            x = (std::max)(x, r);
+        }
+        if (x < end) add(x, end);
+    }
+    if (!ArcWindowsOn()) return out;
     for (auto& [h, b] : t_arcWin) {
         auto bar = b.toolbar.get();
         if (!bar || bar.XamlRoot() != root || !ShownOnScreen(bar) || bar.ActualWidth() <= 0) continue;
@@ -6716,7 +6799,7 @@ static void UpdateCaptionTrim() {
         } else
             UntrimCaption(c);
         if (top) TrimSink(top, hiddenBar, c.pageLeft);
-        if (!hiddenBar) UpdateArcWinCaption(c, root);
+        UpdateArcWinCaption(c, root);  // (the sidebar header's drag areas too, toolbar hidden or not)
     }
 }
 
@@ -6841,7 +6924,7 @@ bool Ui_Tick() {
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";
         UpdateNewTabMode();
-        if (tick % 4 == 0) HookSidebarNewTabButtons();
+        if (tick % 4 == 0) HookSidebarNewTabButtons(), UpdateSidebarNoDrag();
         stage = "peek";
         Peek_Tick();
         stage = "hoverCards";
