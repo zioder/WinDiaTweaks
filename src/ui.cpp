@@ -316,6 +316,11 @@ static void RunProbe() {
             o << Media_DebugColors();
             continue;
         }
+        if (nm == L"TIDYPROMPT") {  // the prompt Tidy would send now
+            extern std::string Tidy_PromptText();
+            o << Tidy_PromptText() << '\n';
+            continue;
+        }
         if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
             extern std::string Tidy_DebugFlyouts();
             o << Tidy_DebugFlyouts();
@@ -2094,6 +2099,7 @@ static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
                                      const std::function<bool(const mux::FrameworkElement&)>& want);
 static const wchar_t* kTidyPrompt =
     L"Group my open tabs by topic using only their titles and addresses. Just make the groups; no need to reply.";
+static std::wstring TidyPrompt();  // (kTidyPrompt, told to leave pinned tabs alone when there are some)
 static const double kTidyRowH = 24, kTidyInset = 11, kTidyBroom = 22, kTidyGap = 6;
 static const double kWaveLen = 10, kWaveAmp = 2.25, kWaveBox = 9;
 static const wchar_t kChatBusyGlyph = L'';  // the panel's send button while Dia's chat works (Stop)
@@ -2476,7 +2482,7 @@ static bool PanelPromptIn() {
     auto bar = host ? FindByName(host, L"CommandBarContainerRoot") : nullptr;
     auto box = bar ? FindByName(bar, L"QueryTextBox").try_as<muxc::RichEditBox>() : nullptr;
     if (!box) return false;
-    box.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, kTidyPrompt);
+    box.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, TidyPrompt());
     box.Document().Selection().SetRange(INT_MAX, INT_MAX);
     return true;
 }
@@ -3533,6 +3539,56 @@ static muxc::Grid DiaPinnedSep(const muxc::ScrollViewer& sv) {
         return fe.Name() == L"TabSeparatorRow" && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0;
     }).try_as<muxc::Grid>();
     return sep && sep.IsLoaded() && sep.ColumnDefinitions().Size() >= 2 && !DiaSepAsking(sep) ? sep : nullptr;
+}
+
+// With pinned tabs, Tidy is about the other tabs only: the prompt says so and names the pinned ones (the
+// tab rows above Dia's divider, in the window in front), so the chat leaves them as they are.
+static std::wstring PinnedRowTitle(const mux::FrameworkElement& row) {
+    std::wstring best;
+    FirstIn(row, [&](const mux::FrameworkElement& fe) {
+        if (auto tb = fe.try_as<muxc::TextBlock>()) {
+            std::wstring t(tb.Text());
+            if (t.size() > best.size() && !(t.size() == 1 && t[0] >= 0xE000 && t[0] <= 0xF8FF)) best = t;  // (not an icon glyph)
+        }
+        return false;
+    });
+    return best;
+}
+
+static std::wstring TidyPrompt();
+std::string Tidy_PromptText() { return N(TidyPrompt()); }  // (`diatweaks probe TIDYPROMPT`)
+
+static std::wstring TidyPrompt() {
+    std::vector<std::wstring> pinned;
+    bool any = false;
+    for (auto h : FindNodes(L"TabListScrollViewer")) {
+        auto sv = Obj<muxc::ScrollViewer>(h);
+        if (!sv || !sv.XamlRoot() || sv.ActualWidth() <= 0) continue;
+        HWND top = TopWindowFor(sv.XamlRoot());
+        if (top && DiaIsForeground() && top != GetForegroundWindow()) continue;  // (the window in front)
+        auto sep = DiaPinnedSep(sv);
+        if (!sep) continue;
+        any = true;
+        double sepY = sep.TransformToVisual(sv).TransformPoint({0, 0}).Y;
+        FirstIn(sv, [&](const mux::FrameworkElement& fe) {
+            auto uc = fe.try_as<muxc::UserControl>();
+            auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+            if (!g || g.ColumnDefinitions().Size() != 5 || fe.ActualHeight() <= 0) return false;
+            if (fe.TransformToVisual(sv).TransformPoint({0, 0}).Y >= sepY) return false;
+            auto t = PinnedRowTitle(fe);
+            if (!t.empty() && std::find(pinned.begin(), pinned.end(), t) == pinned.end()) pinned.push_back(t);
+            return false;
+        });
+    }
+    if (!any) return kTidyPrompt;
+    std::wstring p = L"Group my open tabs by topic using only their titles and addresses, but only the tabs that aren't "
+                     L"pinned: leave my pinned tabs exactly as they are (don't group, move, unpin or close them).";
+    if (!pinned.empty()) {
+        p += L" My pinned tabs are:";
+        for (size_t i = 0; i < pinned.size() && i < 40; i++) p += (i ? L", \"" : L" \"") + pinned[i] + L"\"";
+        p += L".";
+    }
+    return p + L" Just make the groups; no need to reply.";
 }
 
 // Pinned tabs: the buttons go into Dia's own divider below them, in the column of its Clear Tabs (kept
