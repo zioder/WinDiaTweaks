@@ -664,6 +664,9 @@ static bool PointerAtTop(DWORD uiThread, bool shown) {
     if (!GetClassNameW(root, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0)
         return shown;
     if (tid != uiThread) return false;
+    // A button held (dragging the window, a tab, a selection): never starts showing the toolbar, or
+    // moving the window by its top would bring it down. (Already shown, it stays while you're on it.)
+    if (!shown && (GetAsyncKeyState(GetSystemMetrics(SM_SWAPBUTTON) ? VK_RBUTTON : VK_LBUTTON) & 0x8000)) return false;
     POINT origin{0, 0};
     ClientToScreen(root, &origin);
     UINT dpi = GetDpiForWindow(root);

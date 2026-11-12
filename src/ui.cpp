@@ -316,6 +316,11 @@ static void RunProbe() {
             o << Media_DebugColors();
             continue;
         }
+        if (nm == L"TIDYPROMPT") {  // the prompt Tidy would send now
+            extern std::string Tidy_PromptText();
+            o << Tidy_PromptText() << '\n';
+            continue;
+        }
         if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
             extern std::string Tidy_DebugFlyouts();
             o << Tidy_DebugFlyouts();
@@ -685,13 +690,14 @@ static void ApplyPreset(const std::wstring& preset) {
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
-                                               L"peek",           L"tidyTabs",            L"mediaControls"};
+                                               L"peek",           L"tidyTabs",            L"mediaControls",
+                                               L"arcPinnedTabs"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
     // the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs",         L"mediaControls"};
+                                                      L"tidyTabs",         L"mediaControls",    L"arcPinnedTabs"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -2084,14 +2090,17 @@ static void UpdateProfileEmoji() {
 // tabs, then eases open (0.2 s). Tidy asks Dia's chat to group the tabs (its GroupTabs tool makes,
 // names and colors the groups); meanwhile the line rolls as a wave, until the chat is done. Clear runs
 // Dia's own Close all tabs and confirms it.
-// Dia's own divider (TabSeparatorRow, "↓ Clear") only exists while Close All Tabs asks to confirm, so
-// the row is ours. It sits above Dia's TabListScrollViewer (moved down by the row's height), so it
-// stays put while the tabs scroll.
+// Without pinned tabs Dia's own divider (TabSeparatorRow, "↓ Clear") only exists while Close All Tabs
+// asks to confirm, so the row is ours. It sits above Dia's TabListScrollViewer (moved down by the row's
+// height), so it stays put while the tabs scroll. With pinned tabs Dia keeps its divider for good
+// between them and the other tabs, with its own "Clear Tabs" button: then the buttons go into that
+// divider instead, in place of Dia's Clear Tabs, and its line is the one that waves (see BuildTidySep).
 static bool DiaIsForeground();
 static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
                                      const std::function<bool(const mux::FrameworkElement&)>& want);
 static const wchar_t* kTidyPrompt =
     L"Group my open tabs by topic using only their titles and addresses. Just make the groups; no need to reply.";
+static std::wstring TidyPrompt();  // (kTidyPrompt, told to leave pinned tabs alone when there are some)
 static const double kTidyRowH = 24, kTidyInset = 11, kTidyBroom = 22, kTidyGap = 6;
 static const double kWaveLen = 10, kWaveAmp = 2.25, kWaveBox = 9;
 static const wchar_t kChatBusyGlyph = L'';  // the panel's send button while Dia's chat works (Stop)
@@ -2110,7 +2119,7 @@ struct TidyRow {
     winrt::weak_ref<muxc::ScrollViewer> scroll;  // Dia's TabListScrollViewer
     winrt::weak_ref<muxc::Grid> root;            // Dia's RootGrid (holds the scroll viewer and our row)
     winrt::weak_ref<muxc::Grid> row;
-    winrt::weak_ref<muxsh::Rectangle> line;
+    winrt::weak_ref<mux::UIElement> line;  // ours, or (sep) Dia's divider line
     winrt::weak_ref<muxc::Canvas> waveBox;
     winrt::weak_ref<muxsh::Path> wave;
     winrt::weak_ref<muxc::Border> tidyBtn, clearBtn;
@@ -2127,6 +2136,11 @@ struct TidyRow {
     winrt::weak_ref<mux::FrameworkElement> stripHost;  // (strip) Dia's TabStripContentHost, narrowed to make room
     bool reserved = false;  // (strip) its margin narrowed (diaMargin holds Dia's)
     winrt::Windows::UI::Color stripColor{0xff, 0xff, 0xff, 0xff};  // (strip) the color of Dia's + (follows the bar)
+    bool sep = false;  // pinned tabs: the buttons sit in Dia's own divider below them (no row of ours)
+    winrt::weak_ref<muxc::Grid> sepGrid;            // (sep) Dia's TabSeparatorRow
+    winrt::weak_ref<muxc::Button> diaClear;         // (sep) Dia's Clear Tabs button, kept out of sight
+    wf::IInspectable diaClearMaxW{nullptr}, diaSepHit{nullptr};  // (sep) Dia's own values, put back on removal
+    int64_t sepHitToken = 0;                        // (sep) keeps the divider clickable
 };
 static thread_local std::vector<std::shared_ptr<TidyRow>> t_tidyRows;
 static thread_local winrt::event_token t_tidyFrame{};
@@ -2469,7 +2483,7 @@ static bool PanelPromptIn() {
     auto bar = host ? FindByName(host, L"CommandBarContainerRoot") : nullptr;
     auto box = bar ? FindByName(bar, L"QueryTextBox").try_as<muxc::RichEditBox>() : nullptr;
     if (!box) return false;
-    box.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, kTidyPrompt);
+    box.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, TidyPrompt());
     box.Document().Selection().SetRange(INT_MAX, INT_MAX);
     return true;
 }
@@ -2806,6 +2820,8 @@ static thread_local struct {
     POINT cursor{};
     bool cursorBack = true;
     std::weak_ptr<TidyRow> row;  // the line (or tab-strip icons) whose Clear was clicked: its window only
+    winrt::weak_ref<muxc::Grid> anchor;  // its RootGrid (outlives a divider's buttons, which go when Dia asks)
+    winrt::weak_ref<muxc::Grid> sepGrid;  // (pinned tabs) the divider whose Clear Tabs was pressed: only its own
 } t_clear;
 
 // Every tab row in the list (also those inside groups): Dia's row is a UserControl whose grid has five
@@ -2853,6 +2869,8 @@ static void EndClear(const char* why) {
     Log("clear: %s", why);
     t_clear.phase = 0;
     t_clear.row.reset();
+    t_clear.anchor = nullptr;
+    t_clear.sepGrid = nullptr;
 }
 
 static HWND TopWindowFor(const mux::XamlRoot& root);
@@ -2927,6 +2945,22 @@ static void StartClear(const std::shared_ptr<TidyRow>& rec) {
         Log("clear: closing the loose tabs (tabs on top)");
         return;
     }
+    if (rec->sep) {  // pinned tabs: Dia's own Clear Tabs (hidden behind ours) is pressed, as is
+        auto b = rec->diaClear.get();
+        try {
+            if (!b) throw winrt::hresult_error();
+            winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
+            t_clear.anchor = rec->root;
+            t_clear.sepGrid = rec->sepGrid;
+            t_clear.phase = 2;  // (should Dia ask to confirm after all, its "↓ Clear" is pressed too)
+            t_clear.at = GetTickCount64();
+            t_clear.cursorBack = true;
+            Log("clear: Dia's Clear Tabs pressed");
+            return;
+        } catch (...) {
+            Log("clear: Dia's Clear Tabs wouldn't run; trying Close All Tabs");
+        }
+    }
     POINT at;
     if (!EmptySidebarSpot(*rec, at)) return t_clear.row.reset(), Log("clear: no empty spot of the sidebar to right-click");
     GetCursorPos(&t_clear.cursor);
@@ -2950,8 +2984,8 @@ static void RunClear() {
     if (!t_clear.phase) return;
     ULONGLONG since = GetTickCount64() - t_clear.at;
     auto rec = t_clear.row.lock();
-    auto anchor = rec ? rec->root.get() : nullptr;
-    if (!rec || !anchor || !anchor.XamlRoot()) return EndClear("its window went away");
+    auto anchor = rec ? rec->root.get() : t_clear.anchor.get();
+    if (!anchor || !anchor.XamlRoot() || (!rec && t_clear.phase != 2)) return EndClear("its window went away");
     if (t_clear.phase == 3) {
         auto tab = NextLooseStripTab(rec->stripHost.get());
         if (!tab) return EndClear("done");
@@ -2989,15 +3023,17 @@ static void RunClear() {
         return;
     }
     // Dia's "↓ Clear" line: press it.
+    auto sepGrid = t_clear.sepGrid.get();
     for (auto h : FindNodes(L"CloseAllButton"))
         if (auto b = Obj<muxc::Button>(h); b && b.IsLoaded() && b.ActualWidth() > 0 && b.XamlRoot() == anchor.XamlRoot()) {
+            if (sepGrid && muxm::VisualTreeHelper::GetParent(b) != sepGrid) continue;
             try {
                 winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
                 return EndClear("done");
             } catch (...) {
             }
         }
-    if (since > 2000) EndClear("Dia's Clear line didn't show");
+    if (since > 2000) EndClear(sepGrid ? "done" : "Dia's Clear line didn't show");
 }
 
 // ---- the row
@@ -3013,6 +3049,28 @@ static void RemoveTidyRow(TidyRow& r) {
                 uint32_t i;
                 if (parent.Children().IndexOf(row, i)) parent.Children().RemoveAt(i);
             }
+    }
+    if (r.sep) {  // Dia's divider as it was: its line, its Clear Tabs, its hit testing
+        auto put = [](const mux::DependencyObject& o, const mux::DependencyProperty& dp, const wf::IInspectable& v) {
+            if (!v || v == mux::DependencyProperty::UnsetValue()) o.ClearValue(dp);
+            else o.SetValue(dp, v);
+        };
+        try {
+            if (auto box = r.waveBox.get())
+                if (auto parent = muxm::VisualTreeHelper::GetParent(box).try_as<muxc::Panel>()) {
+                    uint32_t i;
+                    if (parent.Children().IndexOf(box, i)) parent.Children().RemoveAt(i);
+                }
+            if (auto l = r.line.get()) l.Opacity(1);
+            if (auto b = r.diaClear.get()) put(b, mux::FrameworkElement::MaxWidthProperty(), r.diaClearMaxW);
+            if (auto g = r.sepGrid.get()) {
+                if (r.sepHitToken) g.UnregisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(), r.sepHitToken);
+                put(g, mux::UIElement::IsHitTestVisibleProperty(), r.diaSepHit);
+            }
+        } catch (...) {
+        }
+        r.sepHitToken = 0;
+        return;
     }
     if (auto sv = r.scroll.get()) sv.Margin(r.diaMargin);
     if (auto host = r.stripHost.get(); host && r.reserved) host.Margin(r.diaMargin);
@@ -3161,7 +3219,7 @@ static void SetTidyBusy(bool busy) {
         ShowWave(p, busy);
         if (p->strip) PulseBroom(*p, busy);
         StyleButtons(*p);
-        if (busy) p->target = 1, p->hideAt = 0;
+        if (busy) p->target = p->eligible ? 1 : 0, p->hideAt = 0;  // (a window with pinned tabs: its divider, not our row)
         else p->hideAt = GetTickCount64() + 1500;  // a moment to see it settle, then it follows the pointer again
     }
     EnsureTidyFrames();
@@ -3184,7 +3242,7 @@ static void CheckUnpark() {
 
 // Open when: busy, Show = Always (with tabs to act on), or hovered.
 static double TidyWant(const TidyRow& r, bool always) {
-    return (TidyBusy() || (r.eligible && (always || r.hovered))) ? 1 : 0;
+    return (r.eligible && (TidyBusy() || always || r.hovered)) ? 1 : 0;
 }
 
 static bool TidyAnimate() {
@@ -3218,7 +3276,7 @@ static bool TidyAnimate() {
             more = true;
         }
         double e = r.progress * r.progress * (3 - 2 * r.progress);
-        if (r.strip) {
+        if (r.strip || r.sep) {  // (sep: Dia's line makes room for the buttons, as for its own Clear Tabs)
             if (auto row = r.row.get()) {
                 if (std::abs(row.Opacity() - e) > 0.001) row.Opacity(e);
                 row.IsHitTestVisible(e > 0.5);
@@ -3273,6 +3331,14 @@ static bool InTidyZone(TidyRow& r, mux::Input::PointerRoutedEventArgs const& e) 
     auto root = r.root.get();
     if (!sv || !root) return false;
     auto pt = e.GetCurrentPoint(root).Position();
+    if (r.sep) {  // (pinned tabs) on Dia's divider, which scrolls with the tabs: while it's in view
+        auto g = r.sepGrid.get();
+        if (!g || !g.IsLoaded()) return false;
+        auto at = g.TransformToVisual(root).TransformPoint({0, 0});
+        auto svAt = sv.TransformToVisual(root).TransformPoint({0, 0});
+        if (pt.Y < svAt.Y || pt.Y > svAt.Y + sv.ActualHeight()) return false;
+        return pt.X >= svAt.X && pt.X <= svAt.X + sv.ActualWidth() && pt.Y >= at.Y - 4 && pt.Y <= at.Y + g.ActualHeight() + 4;
+    }
     auto top = sv.TransformToVisual(root).TransformPoint({0, 0});
     double rowTop = top.Y - (sv.Margin().Top - r.diaMargin.Top);
     double open = kTidyRowH * r.progress;
@@ -3333,6 +3399,71 @@ static muxc::Border TidyButton(const std::shared_ptr<TidyRow>& rec, bool isTidy,
     return b;
 }
 
+// The wave (shown over the line while Tidy works), in a box as wide as the line.
+static muxc::Canvas MakeWaveBox(const std::shared_ptr<TidyRow>& rec) {
+    std::weak_ptr<TidyRow> weak = rec;
+    auto box = muxc::Canvas();
+    box.Height(kWaveBox);
+    box.VerticalAlignment(mux::VerticalAlignment::Center);
+    box.Visibility(mux::Visibility::Collapsed);
+    auto wave = muxsh::Path();
+    wave.Stroke(BrushRes(L"TextFillColorTertiaryBrush", Rgba(255, 255, 255, 0x87)));
+    wave.StrokeThickness(1.25);
+    wave.StrokeStartLineCap(muxm::PenLineCap::Round), wave.StrokeEndLineCap(muxm::PenLineCap::Round);
+    box.Children().Append(wave);
+    {  // (animated on the compositor: smooth even while Dia's UI thread is busy)
+        using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
+        ElementCompositionPreview::SetIsTranslationEnabled(wave, true);
+        auto v = ElementCompositionPreview::GetElementVisual(wave);
+        v.CenterPoint({0, (float)(kWaveBox / 2), 0});
+        v.Scale({1, 0, 1});
+    }
+    box.SizeChanged([weak](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
+        auto p = weak.lock();
+        auto c = s.try_as<muxc::Canvas>();
+        if (!p || !c) return;
+        float w = e.NewSize().Width;
+        muxm::RectangleGeometry g;
+        g.Rect({0, 0, w, (float)kWaveBox});
+        c.Clip(g);
+        if (std::abs(w - p->waveW) > 1)
+            if (auto path = p->wave.get()) path.Data(WaveGeometry(w)), p->waveW = w;
+    });
+    rec->waveBox = winrt::make_weak(box);
+    rec->wave = winrt::make_weak(wave);
+    return box;
+}
+
+// Hover: open near the line, shut 150 ms after the pointer leaves (busy keeps it open).
+static void TrackTidyHover(const std::shared_ptr<TidyRow>& rec, const muxc::Grid& root) {
+    std::weak_ptr<TidyRow> weak = rec;
+    rec->moved = root.PointerMoved([weak](auto&&, mux::Input::PointerRoutedEventArgs const& e) {
+        auto p = weak.lock();
+        if (!p || !Engine_TweakOn(L"tidyTabs")) return;
+        bool in = InTidyZone(*p, e);
+        if (in == p->hovered) return;
+        p->hovered = in;
+        if (in && p->eligible) p->hideAt = 0, p->target = 1;
+        else if (!in && !p->hideAt) p->hideAt = GetTickCount64() + 150;
+        EnsureTidyFrames();
+    });
+    rec->exited = root.PointerExited([weak](auto&&, auto&&) {
+        auto p = weak.lock();
+        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 150, EnsureTidyFrames();
+    });
+}
+
+// The buttons, laid out for the options (our row's, or in Dia's divider).
+static muxc::StackPanel TidyButtons(const std::shared_ptr<TidyRow>& rec, const TidyLook& look) {
+    auto buttons = muxc::StackPanel();
+    buttons.Orientation(muxc::Orientation::Horizontal);
+    buttons.Spacing(look.text ? 6 : 2);
+    buttons.VerticalAlignment(mux::VerticalAlignment::Center);
+    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, look.text));
+    if (look.clear) buttons.Children().Append(TidyButton(rec, false, look.text));
+    return buttons;
+}
+
 static std::shared_ptr<TidyRow> BuildTidyRow(const muxc::ScrollViewer& sv, const muxc::Grid& root, const TidyLook& look) {
     auto rec = std::make_shared<TidyRow>();
     rec->scroll = winrt::make_weak(sv);
@@ -3371,70 +3502,149 @@ static std::shared_ptr<TidyRow> BuildTidyRow(const muxc::ScrollViewer& sv, const
     line.VerticalAlignment(mux::VerticalAlignment::Center);
     line.Fill(BrushRes(L"DividerStrokeColorDefaultBrush", Rgba(255, 255, 255, 0x1a)));
     lineArea.Children().Append(line);
-    auto box = muxc::Canvas();
-    box.Height(kWaveBox);
-    box.VerticalAlignment(mux::VerticalAlignment::Center);
-    box.Visibility(mux::Visibility::Collapsed);
-    auto wave = muxsh::Path();
-    wave.Stroke(BrushRes(L"TextFillColorTertiaryBrush", Rgba(255, 255, 255, 0x87)));
-    wave.StrokeThickness(1.25);
-    wave.StrokeStartLineCap(muxm::PenLineCap::Round), wave.StrokeEndLineCap(muxm::PenLineCap::Round);
-    box.Children().Append(wave);
-    {  // (animated on the compositor: smooth even while Dia's UI thread is busy)
-        using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
-        ElementCompositionPreview::SetIsTranslationEnabled(wave, true);
-        auto v = ElementCompositionPreview::GetElementVisual(wave);
-        v.CenterPoint({0, (float)(kWaveBox / 2), 0});
-        v.Scale({1, 0, 1});
-    }
-    box.SizeChanged([weak](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
-        auto p = weak.lock();
-        auto c = s.try_as<muxc::Canvas>();
-        if (!p || !c) return;
-        float w = e.NewSize().Width;
-        muxm::RectangleGeometry g;
-        g.Rect({0, 0, w, (float)kWaveBox});
-        c.Clip(g);
-        if (std::abs(w - p->waveW) > 1)
-            if (auto path = p->wave.get()) path.Data(WaveGeometry(w)), p->waveW = w;
-    });
-    lineArea.Children().Append(box);
+    lineArea.Children().Append(MakeWaveBox(rec));
     row.Children().Append(lineArea);
 
     // The buttons.
-    auto buttons = muxc::StackPanel();
-    buttons.Orientation(muxc::Orientation::Horizontal);
-    buttons.Spacing(look.text ? 6 : 2);
-    buttons.VerticalAlignment(mux::VerticalAlignment::Center);
+    auto buttons = TidyButtons(rec, look);
     buttons.Margin({0, 0, kTidyInset - 4, 0});
-    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, look.text));
-    if (look.clear) buttons.Children().Append(TidyButton(rec, false, look.text));
     muxc::Grid::SetColumn(buttons, 1);
     row.Children().Append(buttons);
 
     root.Children().Append(row);
     rec->row = winrt::make_weak(row);
-    rec->line = winrt::make_weak(line);
-    rec->waveBox = winrt::make_weak(box);
-    rec->wave = winrt::make_weak(wave);
+    rec->line = winrt::make_weak(mux::UIElement(line));
     StyleButtons(*rec);
-
-    // Hover: open near the top of the tabs, shut 150 ms after the pointer leaves (busy keeps it open).
-    rec->moved = root.PointerMoved([weak](auto&&, mux::Input::PointerRoutedEventArgs const& e) {
-        auto p = weak.lock();
-        if (!p || !Engine_TweakOn(L"tidyTabs")) return;
-        bool in = InTidyZone(*p, e);
-        if (in == p->hovered) return;
-        p->hovered = in;
-        if (in && p->eligible) p->hideAt = 0, p->target = 1;
-        else if (!in && !p->hideAt) p->hideAt = GetTickCount64() + 150;
-        EnsureTidyFrames();
-    });
-    rec->exited = root.PointerExited([weak](auto&&, auto&&) {
-        auto p = weak.lock();
-        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 150, EnsureTidyFrames();
-    });
+    TrackTidyHover(rec, root);
     Log("tidy: row added (%s)", N(rec->look).c_str());
+    return rec;
+}
+
+// Dia's divider in a state of its own (Close All Tabs asking to confirm: its "↓ Clear", an icon and
+// "Clear"), not the lasting one below pinned tabs ("Clear Tabs").
+static bool DiaSepAsking(const muxc::Grid& sep) {
+    auto b = FirstIn(sep, [](const mux::FrameworkElement& fe) { return fe.Name() == L"CloseAllButton"; });
+    if (!b) return false;
+    if (FirstIn(b, [](const mux::FrameworkElement& fe) { return (bool)fe.try_as<muxc::FontIcon>(); })) return true;
+    auto label = FirstIn(b, [](const mux::FrameworkElement& fe) { return (bool)fe.try_as<muxc::TextBlock>(); }).try_as<muxc::TextBlock>();
+    if (!label) return false;
+    std::wstring t;
+    for (wchar_t c : std::wstring_view(label.Text()))
+        if (!iswspace(c)) t += (wchar_t)towlower(c);
+    return t == L"clear";
+}
+
+// Dia's lasting divider below pinned tabs, in this tab list (it scrolls with the tabs), if it's shown.
+static muxc::Grid DiaPinnedSep(const muxc::ScrollViewer& sv) {
+    auto sep = FirstIn(sv, [](const mux::FrameworkElement& fe) {
+        return fe.Name() == L"TabSeparatorRow" && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0;
+    }).try_as<muxc::Grid>();
+    return sep && sep.IsLoaded() && sep.ColumnDefinitions().Size() >= 2 && !DiaSepAsking(sep) ? sep : nullptr;
+}
+
+// With pinned tabs, Tidy is about the other tabs only: the prompt says so and names the pinned ones (the
+// tab rows above Dia's divider, in the window in front), so the chat leaves them as they are.
+static std::wstring PinnedRowTitle(const mux::FrameworkElement& row) {
+    std::wstring best;
+    FirstIn(row, [&](const mux::FrameworkElement& fe) {
+        if (auto tb = fe.try_as<muxc::TextBlock>()) {
+            std::wstring t(tb.Text());
+            if (t.size() > best.size() && !(t.size() == 1 && t[0] >= 0xE000 && t[0] <= 0xF8FF)) best = t;  // (not an icon glyph)
+        }
+        return false;
+    });
+    return best;
+}
+
+static std::wstring TidyPrompt();
+std::string Tidy_PromptText() { return N(TidyPrompt()); }  // (`diatweaks probe TIDYPROMPT`)
+
+static std::wstring TidyPrompt() {
+    std::vector<std::wstring> pinned;
+    bool any = false;
+    for (auto h : FindNodes(L"TabListScrollViewer")) {
+        auto sv = Obj<muxc::ScrollViewer>(h);
+        if (!sv || !sv.XamlRoot() || sv.ActualWidth() <= 0) continue;
+        HWND top = TopWindowFor(sv.XamlRoot());
+        if (top && DiaIsForeground() && top != GetForegroundWindow()) continue;  // (the window in front)
+        auto sep = DiaPinnedSep(sv);
+        if (!sep) continue;
+        any = true;
+        double sepY = sep.TransformToVisual(sv).TransformPoint({0, 0}).Y;
+        FirstIn(sv, [&](const mux::FrameworkElement& fe) {
+            auto uc = fe.try_as<muxc::UserControl>();
+            auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+            if (!g || g.ColumnDefinitions().Size() != 5 || fe.ActualHeight() <= 0) return false;
+            if (fe.TransformToVisual(sv).TransformPoint({0, 0}).Y >= sepY) return false;
+            auto t = PinnedRowTitle(fe);
+            if (!t.empty() && std::find(pinned.begin(), pinned.end(), t) == pinned.end()) pinned.push_back(t);
+            return false;
+        });
+    }
+    if (!any) return kTidyPrompt;
+    std::wstring p = L"Group my open tabs by topic using only their titles and addresses, but only the tabs that aren't "
+                     L"pinned: leave my pinned tabs exactly as they are (don't group, move, unpin or close them).";
+    if (!pinned.empty()) {
+        p += L" My pinned tabs are:";
+        for (size_t i = 0; i < pinned.size() && i < 40; i++) p += (i ? L", \"" : L" \"") + pinned[i] + L"\"";
+        p += L".";
+    }
+    return p + L" Just make the groups; no need to reply.";
+}
+
+// Pinned tabs: the buttons go into Dia's own divider below them, in the column of its Clear Tabs (kept
+// out of sight with MaxWidth 0, as Dia shows and hides it itself), and Dia's line is the one that waves.
+// The divider lets no clicks through as Dia has it; it's made clickable (its empty parts still aren't).
+static std::shared_ptr<TidyRow> BuildTidySep(const muxc::ScrollViewer& sv, const muxc::Grid& root, const muxc::Grid& sep,
+                                             const TidyLook& look) {
+    auto rec = std::make_shared<TidyRow>();
+    rec->sep = true;
+    rec->scroll = winrt::make_weak(sv);
+    rec->root = winrt::make_weak(root);
+    rec->sepGrid = winrt::make_weak(sep);
+    rec->look = look.key();
+    mux::FrameworkElement diaLine{nullptr};
+    for (auto const& c : sep.Children()) {
+        auto fe = c.try_as<mux::FrameworkElement>();
+        if (!fe) continue;
+        if (fe.Name() == L"CloseAllButton") {
+            if (auto b = fe.try_as<muxc::Button>()) {
+                rec->diaClear = winrt::make_weak(b);
+                rec->diaClearMaxW = b.ReadLocalValue(mux::FrameworkElement::MaxWidthProperty());
+                b.MaxWidth(0);
+            }
+        } else if (!diaLine && fe.try_as<muxc::Border>() && muxc::Grid::GetColumn(fe) == 0)
+            diaLine = fe;
+    }
+    if (diaLine) {  // the wave, over Dia's line (and as wide)
+        auto box = MakeWaveBox(rec);
+        muxc::Grid::SetColumn(box, 0);
+        muxc::Grid::SetColumnSpan(box, muxc::Grid::GetColumnSpan(diaLine));
+        box.Margin(diaLine.Margin());
+        box.IsHitTestVisible(false);
+        sep.Children().Append(box);
+        rec->line = winrt::make_weak(mux::UIElement(diaLine));
+    }
+    auto row = muxc::Grid();
+    row.Name(L"diatweaksTidySep");
+    row.Opacity(0);
+    row.Visibility(mux::Visibility::Collapsed);
+    row.VerticalAlignment(mux::VerticalAlignment::Center);
+    row.Margin({kTidyGap, 0, 0, 0});
+    muxc::Grid::SetColumn(row, 1);
+    row.Children().Append(TidyButtons(rec, look));
+    sep.Children().Append(row);
+    rec->row = winrt::make_weak(row);
+    rec->diaSepHit = sep.ReadLocalValue(mux::UIElement::IsHitTestVisibleProperty());
+    sep.IsHitTestVisible(true);
+    rec->sepHitToken = sep.RegisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(),
+                                                           [](mux::DependencyObject const& o, mux::DependencyProperty const&) {
+                                                               if (auto g = o.try_as<mux::UIElement>(); g && !g.IsHitTestVisible())
+                                                                   g.IsHitTestVisible(true);
+                                                           });
+    StyleButtons(*rec);
+    TrackTidyHover(rec, root);
+    Log("tidy: buttons put in Dia's divider (%s)", N(rec->look).c_str());
     return rec;
 }
 
@@ -3547,6 +3757,11 @@ static void UpdateTidyTabs() {
         auto host = r.root.get();
         auto sh = r.stripHost.get();
         bool gone = r.strip ? (!sh || !sh.IsLoaded() || sh.ActualWidth() <= 0) : !r.scroll.get();
+        if (r.sep && !gone) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
+            auto g = r.sepGrid.get();
+            gone = !g || DiaPinnedSep(r.scroll.get()) != g;
+            if (g && !gone && !g.IsHitTestVisible()) g.IsHitTestVisible(true);
+        }
         bool stale = gone || !r.row.get() || !host || (r.look != (r.strip ? StripLook(look) : look.key()) && !TidyBusy());
         if (!on || stale) {
             RemoveTidyRow(r);
@@ -3555,25 +3770,40 @@ static void UpdateTidyTabs() {
             ++it;
     }
     if (!on) return;
-    // Dia's own divider is up (Close All Tabs is asking): ours shuts.
+    // Dia's own divider is up asking to confirm Close All Tabs: ours shuts. (The lasting one below pinned
+    // tabs takes the buttons instead: see BuildTidySep.)
     bool diaLine = false;
     for (auto h : FindNodes(L"TabSeparatorRow"))
-        if (auto fe = Obj<mux::FrameworkElement>(h); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0)
+        if (auto fe = Obj<muxc::Grid>(h); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0 && DiaSepAsking(fe))
             diaLine = true;
     for (auto h : FindNodes(L"TabListScrollViewer")) {
         auto sv = Obj<muxc::ScrollViewer>(h);
         auto root = sv ? muxm::VisualTreeHelper::GetParent(sv).try_as<muxc::Grid>() : nullptr;
         if (!root || root.Name() != L"RootGrid") continue;
-        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->scroll.get() == sv; });
+        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return !p->sep && p->scroll.get() == sv; });
         if (it == t_tidyRows.end()) {
             t_tidyRows.push_back(BuildTidyRow(sv, root, look));
             it = std::prev(t_tidyRows.end());
         }
         auto& r = **it;
+        // Pinned tabs: the buttons are in Dia's divider below them, and our row stays shut.
+        auto sep = DiaPinnedSep(sv);
         // Any tabs in the list, loose or in groups (Clear and a new Tidy both apply to grouped tabs too).
-        r.eligible = !diaLine && (TabsBelow(sv) > 0 || !AllTabRows().empty());
+        bool tabs = TabsBelow(sv) > 0 || !AllTabRows().empty();
+        r.eligible = !diaLine && !sep && tabs;
         double want = TidyWant(r, look.always);
         if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
+        if (!sep) continue;
+        auto si = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->sep && p->sepGrid.get() == sep; });
+        if (si == t_tidyRows.end()) {
+            t_tidyRows.push_back(BuildTidySep(sv, root, sep, look));
+            si = std::prev(t_tidyRows.end());
+            if (TidyBusy()) ShowWave(*si, true), (*si)->target = 1;
+        }
+        auto& s = **si;
+        s.eligible = !diaLine && tabs;
+        double sw = TidyWant(s, look.always);
+        if (sw != s.target && !s.hideAt) s.target = sw, EnsureTidyFrames();
     }
     for (auto h : FindNodes(L"TabStripContentHost")) {
         auto host = Obj<muxc::Grid>(h);
@@ -3679,6 +3909,370 @@ static void ScheduleHoverCards() {
         } catch (...) {
         }
     });
+}
+
+// ---------------------------------------------------------------- Arc pinned tabs
+// Like Arc's pinned tabs: on hover, a pinned tab that has gone somewhere else shows "–" at its right
+// end, which takes it back to its pinned page (Dia's own "Back to Pinned URL"); one still on its page
+// shows ✕, Dia's own Close tab (which Dia leaves off pinned tabs outside folders, and which removes
+// the pinned tab, as its menu's Close does). A tab is pinned when its row is above Dia's
+// TabSeparatorRow (the line with Clear) in the sidebar's list. Dia's row is a UserControl whose grid
+// has five columns, its ✕ ("Close tab") in the last; "Back to Pinned URL" is a button Dia adds over
+// the icon while the tab is away from its pinned page.
+// Nothing is added to Dia's row (Dia adds and removes its own buttons there, and a stranger among
+// them broke Back to Pinned URL and then Dia): the – / ✕ is a button in a popup laid over the row's
+// right end, and its click presses Dia's own button. Under it Dia's ✕ is kept laid out (invisible,
+// not clickable) so the title fades out before it, as on any hovered tab.
+
+struct PinnedRow {
+    winrt::weak_ref<muxc::UserControl> row;
+    winrt::weak_ref<muxc::Grid> grid;
+    winrt::event_token entered{}, exited{}, canceled{};
+    bool pinned = false, inFolder = false;
+};
+static thread_local std::vector<PinnedRow> t_pinnedRows;
+
+static thread_local struct {
+    muxc::Primitives::Popup popup{nullptr};
+    muxc::Button button{nullptr};
+    muxc::FontIcon icon{nullptr};
+    winrt::weak_ref<muxc::Grid> grid;      // the row it's over
+    // Dia's ✕ on that row, held in the layout but invisible while ours is over it: its column then
+    // takes the room it takes on any hovered tab, so the title stops short of our button.
+    winrt::weak_ref<muxc::Button> held;
+    mux::Visibility heldVisibility = mux::Visibility::Collapsed;
+    int64_t heldToken = 0;
+    bool away = false;                     // showing – (else ✕)
+    bool overRow = false, overButton = false;
+    winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer timer{nullptr};
+} t_pin;
+
+static muxc::Button RowButton(const muxc::Grid& g, const wchar_t* name, bool visibleOnly) {
+    for (auto const& c : g.Children())
+        if (auto b = c.try_as<muxc::Button>()) {
+            if (visibleOnly && b.Visibility() != mux::Visibility::Visible) continue;
+            if (winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(b) == name) return b;
+        }
+    return nullptr;
+}
+
+static PinnedRow* PinnedRowFor(const muxc::Grid& g) {
+    for (auto& r : t_pinnedRows)
+        if (g && r.grid.get() == g) return &r;
+    return nullptr;
+}
+
+static void ReleaseDiaClose() {
+    if (auto c = t_pin.held.get()) {
+        c.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), t_pin.heldToken);
+        c.Opacity(1), c.IsHitTestVisible(true);
+        c.Visibility(t_pin.heldVisibility);
+    }
+    t_pin.held = nullptr;
+    t_pin.heldToken = 0;
+}
+
+static void HoldDiaClose(const muxc::Button& close) {
+    if (t_pin.held.get() == close) return;
+    ReleaseDiaClose();
+    t_pin.heldVisibility = close.Visibility();
+    close.Opacity(0), close.IsHitTestVisible(false);
+    close.Visibility(mux::Visibility::Visible);
+    t_pin.held = winrt::make_weak(close);
+    // Dia collapses it again when its own hover ends (or never shows it, on pinned tabs): keep it laid out.
+    t_pin.heldToken = close.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), [](auto const& sender, auto&&) {
+        if (auto c = sender.template try_as<muxc::Button>(); c && t_pin.held.get() == c && c.Visibility() != mux::Visibility::Visible)
+            c.Visibility(mux::Visibility::Visible);
+    });
+}
+
+static void HidePinButton() {
+    ReleaseDiaClose();
+    if (t_pin.popup && t_pin.popup.IsOpen()) t_pin.popup.IsOpen(false);
+    t_pin.grid = nullptr;
+    t_pin.overRow = t_pin.overButton = false;
+}
+
+static void PressPinButton() {
+    auto g = t_pin.grid.get();
+    bool away = t_pin.away;
+    HidePinButton();
+    if (!g) return;
+    // What it showed when clicked: – only ever goes back (never closes, which removes a pinned tab).
+    if (away) {
+        if (auto back = RowButton(g, L"Back to Pinned URL", false)) PressButton(back, "back to pinned");
+    } else {
+        PressButton(RowButton(g, L"Close tab", false), "close pinned");
+    }
+}
+
+static void MakePinButton() {
+    if (t_pin.popup) return;
+    t_pin.icon = muxc::FontIcon();
+    t_pin.icon.FontSize(10);
+    t_pin.button = muxc::Button();
+    t_pin.button.Name(L"diatweaksPinnedButton");
+    t_pin.button.Content(t_pin.icon);
+    t_pin.button.Click([](auto&&, auto&&) {
+        try {
+            PressPinButton();
+        } catch (...) {
+        }
+    });
+    t_pin.button.PointerEntered([](auto&&, auto&&) { t_pin.overButton = true; });
+    t_pin.button.PointerExited([](auto&&, auto&&) {
+        t_pin.overButton = false;
+        if (t_pin.timer) t_pin.timer.Start();
+    });
+    t_pin.popup = muxc::Primitives::Popup();
+    t_pin.popup.ShouldConstrainToRootBounds(false);
+    t_pin.popup.Child(t_pin.button);
+    // Leaving the row for the button (or back) fires a leave before the enter: decide a moment later.
+    t_pin.timer = t_pin.button.DispatcherQueue().CreateTimer();
+    t_pin.timer.Interval(std::chrono::milliseconds(80));
+    t_pin.timer.IsRepeating(false);
+    t_pin.timer.Tick([](auto&&, auto&&) {
+        try {
+            if (!t_pin.overRow && !t_pin.overButton) HidePinButton();
+        } catch (...) {
+        }
+    });
+}
+
+// Dia's ✕ look, set on the button itself (Dia's style doesn't reach into a popup): no fill until the
+// pointer is on it, a faint square then, the glyph in the sidebar's text color.
+static void StylePinButton(bool dark) {
+    static thread_local int styled = -1;
+    if (styled == (int)dark) return;
+    styled = dark;
+    auto& b = t_pin.button;
+    auto brush = [](uint8_t a, uint8_t v) { return muxm::SolidColorBrush(winrt::Windows::UI::ColorHelper::FromArgb(a, v, v, v)); };
+    uint8_t ink = dark ? 255 : 0;
+    auto res = b.Resources();
+    auto put = [&](const wchar_t* key, const muxm::SolidColorBrush& v) { res.Insert(winrt::box_value(key), v); };
+    put(L"ButtonBackground", brush(0, ink));
+    put(L"ButtonBackgroundPointerOver", brush(dark ? 0x26 : 0x14, ink));
+    put(L"ButtonBackgroundPressed", brush(dark ? 0x1a : 0x0e, ink));
+    put(L"ButtonBorderBrush", brush(0, ink));
+    put(L"ButtonBorderBrushPointerOver", brush(0, ink));
+    put(L"ButtonBorderBrushPressed", brush(0, ink));
+    put(L"ButtonForeground", brush(dark ? 0xcc : 0xb3, ink));
+    put(L"ButtonForegroundPointerOver", brush(0xff, ink));
+    put(L"ButtonForegroundPressed", brush(dark ? 0xb3 : 0x99, ink));
+    b.Background(brush(0, ink));
+    b.BorderThickness({0, 0, 0, 0});
+    b.Padding({0, 0, 0, 0});
+    b.CornerRadius({4, 4, 4, 4});
+    b.MinWidth(0), b.MinHeight(0);
+    b.HorizontalContentAlignment(mux::HorizontalAlignment::Center);
+    b.VerticalContentAlignment(mux::VerticalAlignment::Center);
+    b.RequestedTheme(dark ? mux::ElementTheme::Dark : mux::ElementTheme::Light);
+    t_pin.icon.FontFamily(muxm::FontFamily(L"Segoe Fluent Icons, Segoe MDL2 Assets"));
+}
+
+// Shows (or moves) the – / ✕ over this row's right end, where Dia's own ✕ goes. False: not for this row.
+static bool PlacePinButton(const PinnedRow& r) {
+    auto g = r.grid.get();
+    auto row = r.row.get();
+    if (!g || !row || !row.IsLoaded() || !r.pinned || g.ActualWidth() <= 0 || !g.XamlRoot()) return false;
+    auto close = RowButton(g, L"Close tab", false);
+    if (!close) return false;
+    bool away = RowButton(g, L"Back to Pinned URL", true) != nullptr;
+    if (!away && r.inFolder) return false;  // (Dia shows its own ✕ there)
+    MakePinButton();
+    t_pin.grid = winrt::make_weak(g);
+    bool wasHeld = t_pin.held.get() == close;
+    HoldDiaClose(close);
+    if (!wasHeld) g.UpdateLayout();  // (its column now has its width: place ours on it)
+    auto& b = t_pin.button;
+    double w = close.ActualWidth() > 0 ? close.ActualWidth() : 22, h = close.ActualHeight() > 0 ? close.ActualHeight() : 22;
+    if (b.Width() != w) b.Width(w), b.Height(h);
+    StylePinButton(g.ActualTheme() != mux::ElementTheme::Light);
+    winrt::hstring glyph = away ? L"" : L"";  // Remove (–) / Cancel (✕, as Dia's)
+    if (t_pin.icon.Glyph() != glyph) {
+        t_pin.icon.Glyph(glyph);
+        const wchar_t* label = away ? L"Back to Pinned URL" : L"Close tab";
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, label);
+        muxc::ToolTipService::SetToolTip(b, winrt::box_value(label));
+    }
+    t_pin.away = away;
+    // Right on Dia's (invisible) ✕; before it's laid out, the grid's right end inside padding and margin.
+    double x, y;
+    if (close.ActualWidth() > 0) {
+        auto c = close.TransformToVisual(nullptr).TransformPoint({0, 0});
+        x = c.X, y = c.Y;
+    } else {
+        auto o = g.TransformToVisual(nullptr).TransformPoint({0, 0});
+        x = o.X + g.ActualWidth() - g.Padding().Right - close.Margin().Right - w;
+        y = o.Y + (g.ActualHeight() - h) / 2;
+    }
+    auto& p = t_pin.popup;
+    if (p.XamlRoot() != g.XamlRoot()) p.IsOpen(false), p.XamlRoot(g.XamlRoot());
+    if (std::abs(p.HorizontalOffset() - x) > 0.5) p.HorizontalOffset(x);
+    if (std::abs(p.VerticalOffset() - y) > 0.5) p.VerticalOffset(y);
+    if (!p.IsOpen()) p.IsOpen(true);
+    return true;
+}
+
+static void PinnedRowHover(const winrt::weak_ref<muxc::Grid>& wg, bool on) {
+    auto g = wg.get();
+    auto r = PinnedRowFor(g);
+    if (!r) return;
+    if (on) {
+        t_pin.overRow = PlacePinButton(*r);
+        if (!t_pin.overRow && t_pin.grid.get() == g) HidePinButton();
+    } else if (t_pin.grid.get() == g) {
+        t_pin.overRow = false;
+        if (t_pin.timer) t_pin.timer.Start();
+    }
+}
+
+static void ForgetPinnedRow(PinnedRow& r) {
+    if (auto row = r.row.get()) {
+        row.PointerEntered(r.entered);
+        row.PointerExited(r.exited);
+        row.PointerCanceled(r.canceled);
+    }
+}
+
+static void AdoptPinnedRow(const muxc::UserControl& row, const muxc::Grid& g) {
+    PinnedRow r;
+    r.row = winrt::make_weak(row);
+    r.grid = winrt::make_weak(g);
+    auto wg = r.grid;
+    r.entered = row.PointerEntered([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, true);
+        } catch (...) {
+        }
+    });
+    r.exited = row.PointerExited([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, false);
+        } catch (...) {
+        }
+    });
+    r.canceled = row.PointerCanceled([wg](auto&&, auto&&) {
+        try {
+            PinnedRowHover(wg, false);
+        } catch (...) {
+        }
+    });
+    t_pinnedRows.push_back(std::move(r));
+}
+
+// --- And Dia's own "away from its pinned page" look goes, for Arc's: no "/" after the icon (the Path in
+// Dia's Back to Pinned URL button, which also widens the icon column from 16 to 28) and no "Back to
+// Pinned URL" line under the title on hover. Only properties change: the button stays (invisible, not
+// clickable, no width), so Dia still knows the tab is away and the – above still presses it.
+struct PinnedMark {
+    winrt::weak_ref<muxc::Button> back;
+    double opacity = 1, width = 0;
+    winrt::weak_ref<mux::FrameworkElement> subtitle;
+    mux::Visibility subtitleVisibility = mux::Visibility::Collapsed;
+    int64_t subtitleToken = 0;
+};
+static thread_local std::vector<PinnedMark> t_pinnedMarks;
+
+static void RestorePinnedMark(PinnedMark& m) {
+    if (auto b = m.back.get()) b.Opacity(m.opacity), b.IsHitTestVisible(true), b.Width(m.width);
+    if (auto s = m.subtitle.get()) {
+        s.UnregisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), m.subtitleToken);
+        s.Visibility(m.subtitleVisibility);
+    }
+}
+
+static void UpdatePinnedMarks() {
+    if (!Engine_TweakOn(L"arcPinnedTabs")) {
+        for (auto& m : t_pinnedMarks) RestorePinnedMark(m);
+        t_pinnedMarks.clear();
+        return;
+    }
+    std::erase_if(t_pinnedMarks, [](PinnedMark& m) {
+        auto b = m.back.get();
+        if (b && b.IsLoaded()) return false;
+        RestorePinnedMark(m);
+        return true;
+    });
+    for (auto& row : AllTabRows()) {
+        auto g = row.as<muxc::UserControl>().Content().try_as<muxc::Grid>();
+        auto back = g ? RowButton(g, L"Back to Pinned URL", false) : nullptr;
+        if (!back) continue;
+        if (std::any_of(t_pinnedMarks.begin(), t_pinnedMarks.end(), [&](PinnedMark& m) { return m.back.get() == back; })) {
+            if (back.Opacity() != 0) back.Opacity(0);  // (in case Dia animated it back)
+            if (back.Width() != 0) back.Width(0);
+            continue;
+        }
+        PinnedMark m;
+        m.back = winrt::make_weak(back);
+        m.opacity = back.Opacity();
+        m.width = back.Width();
+        back.Opacity(0), back.IsHitTestVisible(false), back.Width(0);
+        // The line under the title: the grid in the title's stack that holds "Back to Pinned URL".
+        for (auto const& c : g.Children()) {
+            auto stack = c.try_as<muxc::StackPanel>();
+            if (!stack) continue;
+            for (auto const& line : stack.Children()) {
+                auto fe = line.try_as<mux::FrameworkElement>();
+                if (!fe || !FirstIn(fe, [](const mux::FrameworkElement& e) {
+                        auto t = e.try_as<muxc::TextBlock>();
+                        return t && t.Text() == L"Back to Pinned URL";
+                    }))
+                    continue;
+                m.subtitle = winrt::make_weak(fe);
+                m.subtitleVisibility = fe.Visibility();
+                fe.Visibility(mux::Visibility::Collapsed);
+                m.subtitleToken = fe.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), [](auto const& sender, auto&&) {
+                    if (auto e = sender.template try_as<mux::FrameworkElement>(); e && e.Visibility() != mux::Visibility::Collapsed)
+                        e.Visibility(mux::Visibility::Collapsed);
+                });
+            }
+        }
+        t_pinnedMarks.push_back(std::move(m));
+    }
+}
+
+static void UpdatePinnedTabs() {
+    if (!Engine_TweakOn(L"arcPinnedTabs")) {
+        if (t_pin.popup) HidePinButton();
+        for (auto& r : t_pinnedRows) ForgetPinnedRow(r);
+        t_pinnedRows.clear();
+        return;
+    }
+    std::erase_if(t_pinnedRows, [](PinnedRow& r) {  // rows that left the tree
+        auto row = r.row.get();
+        if (row && row.IsLoaded()) return false;
+        ForgetPinnedRow(r);
+        return true;
+    });
+    for (auto& r : t_pinnedRows) r.pinned = false;
+    for (auto h : FindNodes(L"TabSeparatorRow")) {
+        auto sep = Obj<mux::FrameworkElement>(h);
+        auto list = sep ? muxm::VisualTreeHelper::GetParent(sep).try_as<muxc::StackPanel>() : nullptr;
+        if (!list || list.ActualHeight() <= 0) continue;
+        for (auto const& child : list.Children()) {
+            if (child == sep) break;
+            auto top = child.try_as<mux::FrameworkElement>();
+            if (!top) continue;
+            FirstIn(top, [&](const mux::FrameworkElement& fe) {
+                auto uc = fe.try_as<muxc::UserControl>();
+                auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+                if (!g || g.ColumnDefinitions().Size() != 5) return false;
+                bool inFolder = false;  // (another RowsPanel between the row and the list)
+                for (auto p = muxm::VisualTreeHelper::GetParent(fe); p && p != list; p = muxm::VisualTreeHelper::GetParent(p))
+                    if (auto pe = p.try_as<mux::FrameworkElement>(); pe && pe.Name() == L"RowsPanel") inFolder = true;
+                auto r = PinnedRowFor(g);
+                if (!r) AdoptPinnedRow(uc, g), r = PinnedRowFor(g);
+                if (r) r->pinned = true, r->inFolder = inFolder;
+                return false;
+            });
+        }
+    }
+    // Keep the shown button in step: the row scrolled, went back to its page, or stopped being pinned.
+    if (t_pin.popup && t_pin.popup.IsOpen()) {
+        auto r = PinnedRowFor(t_pin.grid.get());
+        if (!r || !PlacePinButton(*r)) HidePinButton();
+    }
 }
 
 // ---------------------------------------------------------------- Clean search box
@@ -3930,6 +4524,15 @@ struct ArcState {
     // ☆ / ⋯ moved so ⋯ sits flush in the pill's corner: the stack, and Dia's own RenderTransform for it.
     winrt::weak_ref<mux::UIElement> flushed;
     muxm::Transform flushedTransform{nullptr};
+    // Dia's address field stays in its toolbar: moving its ☆ / ⋯ buttons out of their tree leaves them
+    // dead (Click still fires but no menu opens). Only the buttons are drawn over the pill (FlushArcTrailing).
+    winrt::weak_ref<mux::FrameworkElement> address;
+    muxm::Transform addressTransform{nullptr};  // Dia's own values, put back when it's returned
+    double addressMaxWidth = 0;
+    winrt::weak_ref<mux::UIElement> addressHit;  // Dia's text/title hit area, made click-through
+    std::vector<winrt::hstring> addressKeys;      // sidebar brushes we added to the field's resources
+    std::vector<winrt::weak_ref<mux::UIElement>> noFocusRing;  // ☆ / ⋯ without a focus ring in the pill
+    std::vector<std::pair<winrt::weak_ref<mux::UIElement>, int>> zSaved;  // paint order we changed (Dia's z)
 };
 static thread_local std::map<InstanceHandle, ArcState> t_arc;
 
@@ -3986,6 +4589,32 @@ static void ReturnMoved(ArcState& st) {
         if (auto c = d.try_as<muxc::Control>()) c.IsTabStop(st.displayTab);
     }
     st.display = nullptr;
+    if (auto hit = st.addressHit.get()) hit.IsHitTestVisible(true);
+    st.addressHit = nullptr;
+    for (auto& w : st.noFocusRing)
+        if (auto u = w.get()) u.ClearValue(mux::UIElement::UseSystemFocusVisualsProperty());
+    st.noFocusRing.clear();
+    if (auto address = st.address.get()) {
+        for (auto& k : st.addressKeys)
+            if (address.Resources().HasKey(winrt::box_value(k))) address.Resources().Remove(winrt::box_value(k));
+        address.RenderTransform(st.addressTransform);
+        address.MaxWidth(st.addressMaxWidth);
+        address.ClearValue(mux::FrameworkElement::RequestedThemeProperty());
+        if (auto tr = FindByName(address, L"UrlBarTrailingStack")) {  // undo the hover fade
+            tr.IsHitTestVisible(true);
+            try {
+                auto v = winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(tr);
+                v.StopAnimation(L"Opacity");
+                v.Opacity(1.0f);
+            } catch (...) {
+            }
+        }
+    }
+    st.address = nullptr;
+    st.addressKeys.clear();
+    for (auto& [w, z] : st.zSaved)
+        if (auto el = w.get()) muxc::Canvas::SetZIndex(el, z);
+    st.zSaved.clear();
     for (auto it = st.moved.rbegin(); it != st.moved.rend(); ++it) {
         auto el = it->el.get();
         auto from = it->from.get();
@@ -4075,12 +4704,20 @@ static bool PointerLeftWindow(const mux::FrameworkElement& el) {
 // Pointer moves anywhere in the window (handled ones too): hover follows them, so a leave (or an
 // enter) the pill's own events missed, e.g. while Dia moved its controls in, is caught on the next move.
 static void TrackArcPointer(const mux::FrameworkElement& el);
+static bool InBounds(const mux::FrameworkElement& el, mux::Input::PointerRoutedEventArgs const& e);
+
+// Dia's address field for the pill: left in its toolbar in the sidebar (see ArcState::address).
+static mux::FrameworkElement ArcHost(const ArcState& st) {
+    if (auto address = st.address.get()) return address;
+    auto url = st.url.get();
+    return url ? FindByName(url, L"AssistantBarHost") : nullptr;
+}
 
 // ☆ / ⋯ fade in while the pointer is over the pill and out when it leaves (Arc's clean pill).
 static void UpdateArcTrailing(ArcState& st, bool animate) {
     auto url = st.url.get();
     if (!url) return;
-    auto host = FindByName(url, L"AssistantBarHost");
+    auto host = ArcHost(st);
     auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
     if (!trailing) return;
     if (trailing.Opacity() != 1) trailing.Opacity(1);  // Dia's own hover binding; ours drives the fade
@@ -4109,9 +4746,68 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
 // small inset from the top, bottom and right edges, with corners that follow the pill's.
 static void FlushArcTrailing(ArcState& st) {
     auto url = st.url.get().try_as<mux::FrameworkElement>();
-    auto host = url ? FindByName(url, L"AssistantBarHost") : nullptr;
+    auto host = url ? ArcHost(st) : nullptr;
     auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
     if (!trailing || url.ActualHeight() <= 0) return;
+    if (host == st.address.get()) {
+        // Still in the toolbar's tree: take the sidebar's theme, not the page's, and draw the toolbar's
+        // branch above the sidebar (at the panel they share) so the buttons show and take clicks there.
+        if (host.RequestedTheme() != url.ActualTheme()) host.RequestedTheme(url.ActualTheme());
+        // Drawn over the pill at the pill's size (the buttons can't be moved out of Dia's field alone: its
+        // rounded border clips them). Dia's text area lets clicks through to the pill, which opens the
+        // command bar itself (BuildArcRows); only the buttons take the pointer.
+        if (std::abs(host.MaxWidth() - url.ActualWidth()) > 0.25) host.MaxWidth(url.ActualWidth());
+        auto move = host.RenderTransform().try_as<muxm::TranslateTransform>();
+        if (!move || move == st.addressTransform) move = muxm::TranslateTransform{}, host.RenderTransform(move);
+        try {
+            auto at = host.TransformToVisual(url).TransformPoint({0, 0});
+            if (std::abs(at.X) > 0.25) move.X(move.X() - at.X);
+            if (std::abs(at.Y) > 0.25) move.Y(move.Y() - at.Y);
+        } catch (...) {
+        }
+        // A menu closed with Esc gives its button keyboard focus, whose ring would stay after the buttons fade.
+        for (auto const& c : trailing.Children())
+            if (auto u = c.try_as<mux::UIElement>(); u && u.UseSystemFocusVisuals()) {
+                u.UseSystemFocusVisuals(false);
+                st.noFocusRing.push_back(winrt::make_weak(u));
+            }
+        if (auto hit = FindByName(host, L"UrlBarHitTarget")) {
+            if (st.addressHit.get() != hit) st.addressHit = winrt::make_weak(hit.as<mux::UIElement>());
+            if (hit.IsHitTestVisible()) hit.IsHitTestVisible(false);
+        }
+        std::vector<mux::DependencyObject> chain;
+        for (mux::DependencyObject d = url; d; d = muxm::VisualTreeHelper::GetParent(d)) chain.push_back(d);
+        for (mux::DependencyObject d = host; d;) {
+            auto parent = muxm::VisualTreeHelper::GetParent(d);
+            if (!parent) break;
+            if (std::find(chain.begin(), chain.end(), parent) == chain.end()) {
+                d = parent;
+                continue;
+            }
+            auto layer = d.try_as<mux::UIElement>();
+            auto panel = parent.try_as<muxc::Panel>();
+            if (layer && panel) {
+                // Paint order at that panel (all z 0, by index): page (with this toolbar), ..., sidebar, then
+                // Dia's overlay layers (command bar, ...). Keep that order but put the page just above the
+                // sidebar: sidebar 1, page 2, everything after the sidebar 3. (Not above the overlays: the page
+                // would cover the command bar.)
+                auto setZ = [&](const mux::UIElement& el, int z) {
+                    bool known = false;
+                    for (auto& [w, orig] : st.zSaved) known |= w.get() == el;
+                    if (!known) st.zSaved.push_back({winrt::make_weak(el), muxc::Canvas::GetZIndex(el)});
+                    if (muxc::Canvas::GetZIndex(el) < z) muxc::Canvas::SetZIndex(el, z);
+                };
+                bool afterSidebar = false;
+                for (auto const& c : panel.Children()) {
+                    if (c == layer) continue;
+                    if (std::find(chain.begin(), chain.end(), c) != chain.end()) setZ(c, 1), afterSidebar = true;
+                    else if (afterSidebar) setZ(c, 3);
+                }
+                if (afterSidebar) setZ(layer, 2);
+            }
+            break;
+        }
+    }
     muxc::Button last{nullptr};
     std::vector<muxc::Button> buttons;
     for (auto const& c : trailing.Children())
@@ -4161,7 +4857,7 @@ static void UpdateArcLabel(ArcState& st) {
                     if (auto pill = muxm::VisualTreeHelper::GetParent(label).try_as<muxc::Panel>()) st.url = winrt::make_weak(pill);
             }
     if (!label) return;
-    if (auto url = st.url.get()) AttachDisplay(st, FindByName(url, L"AssistantBarHost"));
+    if (st.url.get()) AttachDisplay(st, ArcHost(st));
     auto reb = st.display.get().try_as<muxc::RichEditBox>();
     if (!reb) {
         if (!label.Text().empty()) label.Text(L"");  // never show the previous tab's site
@@ -4186,9 +4882,11 @@ static void UpdateArcLabel(ArcState& st) {
     url.UpdateLayout();  // after a tab switch the new tab's chip/buttons must be measured before we place the label
     double left = 12, right = 12;
     try {
-        // Never closer to the pill's edge than on the right.
-        left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
-        auto host = FindByName(url, L"AssistantBarHost");
+        // Never closer to the pill's edge than on the right. (Dia's text is in the pill only outside the
+        // sidebar; there it stays in the toolbar.)
+        if (!st.address.get())
+            left = (std::max)(12.0, reb.TransformToVisual(url).TransformPoint({0, 0}).X + reb.Padding().Left + 1);
+        auto host = ArcHost(st);
         auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
         if (!st.hover)
             right = 12;  // buttons hidden: the site can use the whole pill
@@ -4201,7 +4899,11 @@ static void UpdateArcLabel(ArcState& st) {
     mux::Thickness m{left, 0, right, 0};
     auto cur = label.Margin();
     if (std::abs(cur.Left - m.Left) > 0.5 || std::abs(cur.Right - m.Right) > 0.5) label.Margin(m);
-    if (label.Foreground() != reb.Foreground()) label.Foreground(reb.Foreground());
+    auto color = reb.Foreground();
+    if (st.address.get())
+        if (auto header = st.header.get())
+            if (auto ref = FindByName(header, L"OverflowButton").try_as<muxc::Control>()) color = ref.Foreground();
+    if (label.Foreground() != color) label.Foreground(color);
     if (label.FontFamily() != reb.FontFamily()) label.FontFamily(reb.FontFamily());
 }
 
@@ -4302,6 +5004,10 @@ static void ArcStyleHeader(ArcState& st) {
                 dy = top + 16 - (y + title.ActualHeight() / 2) - 0.6;  // capitals sit a bit below their line's middle
             } catch (...) {
             }
+        // The name's position is measured after layout rounding (whole pixels), so the result moves by up
+        // to a pixel with the shift we gave it last time: keep that shift unless it's a pixel or more off,
+        // or the name hops up and down a pixel on every pass.
+        if (std::abs(dy - c.Top) < 1.0) dy = c.Top;
         mux::Thickness m{(std::max)(0.0, contentStart - colStart), dy, (std::max)(0.0, colEnd - rightStart + 4), -dy};
         if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Right - m.Right) > 0.1 || std::abs(c.Top - m.Top) > 0.1)
             HeaderSet(st, host, mux::FrameworkElement::MarginProperty(), winrt::box_value(m));
@@ -4379,7 +5085,10 @@ static void BuildArcRows(ArcState& st, const muxc::Grid& paging) {
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = true, UpdateArcTrailing(st, true), UpdateArcLabel(st);
     });
-    url.PointerExited([](wf::IInspectable const& sender, auto&&) {
+    url.PointerExited([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
+        // The ☆ / ⋯ buttons drawn over the pill aren't in its tree, and opening their menu takes the
+        // pointer too: only a pointer actually outside the pill hides them.
+        if (InBounds(sender.try_as<mux::FrameworkElement>(), e)) return;
         for (auto& [h, st] : t_arc)
             if (st.url.get() == sender.try_as<muxc::Panel>()) st.hover = false, UpdateArcTrailing(st, true), UpdateArcLabel(st);
     });
@@ -4507,7 +5216,7 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     if (active && active == st.source.get()) return;  // already showing this pane's controls
     if (active && !FindByName(active, L"BackButton")) active = nullptr;  // its controls are elsewhere
     if (!active) {
-        if (auto addr = FindByName(url, L"AssistantBarHost"); addr && addr.Visibility() != mux::Visibility::Visible)
+        if (auto addr = ArcHost(st); addr && addr.Visibility() != mux::Visibility::Visible)
             addr.Visibility(mux::Visibility::Visible);  // Dia hides it on its start page; the pill stays
         return;
     }
@@ -4534,7 +5243,49 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     MoveInto(st, back, right, none, mux::HorizontalAlignment::Left);
     MoveInto(st, fwd, right, none, mux::HorizontalAlignment::Left);
     MoveInto(st, reload, right, none, mux::HorizontalAlignment::Left);
-    MoveInto(st, address, url, {0, 0, 0, 0}, mux::HorizontalAlignment::Stretch);
+    if (sidebar) {
+        st.address = winrt::make_weak(address);
+        st.addressTransform = address.RenderTransform();
+        st.addressMaxWidth = address.MaxWidth();
+        // Dia keeps the site's palette (hover and pressed fills, ...) in the toolbar's resources, which the
+        // field still inherits there: give it the app's own brushes for those keys, as the sidebar has.
+        for (mux::DependencyObject d = muxm::VisualTreeHelper::GetParent(address); d; d = muxm::VisualTreeHelper::GetParent(d)) {
+            auto fe = d.try_as<mux::FrameworkElement>();
+            if (!fe) continue;
+            for (auto const& kv : fe.Resources()) {
+                auto key = kv.Key().try_as<wf::IReference<winrt::hstring>>();
+                if (!key || !kv.Value().try_as<muxm::SolidColorBrush>() || key.Value() == L"NavigationBarBackgroundBrush") continue;
+                auto app = Resource(key.Value().c_str()).try_as<muxm::SolidColorBrush>();
+                if (!app || address.Resources().HasKey(kv.Key())) continue;
+                address.Resources().Insert(kv.Key(), app);
+                st.addressKeys.push_back(key.Value());
+            }
+            if (fe.Name() == L"NavigationBarHost") break;
+        }
+        // Theme resources only re-resolve on a theme change: flip it once so the brushes take.
+        address.RequestedTheme(mux::ElementTheme::Light);
+        address.RequestedTheme(mux::ElementTheme::Dark);
+        // Drawn over the pill, Dia's field takes the pill's clicks: open the command bar from it the same
+        // way (its ☆ / ⋯ buttons keep their own clicks). Only while it's the pill's field.
+        static thread_local std::set<void*> tapHooked;
+        if (tapHooked.insert(winrt::get_abi(address)).second)
+            address.AddHandler(mux::UIElement::TappedEvent(),
+                               winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const& sender,
+                                                                                    mux::Input::TappedRoutedEventArgs const& e) {
+                                   bool pill = false;
+                                   for (auto& [h, st] : t_arc)
+                                       if (st.address.get() == sender.try_as<mux::FrameworkElement>()) pill = true;
+                                   if (!pill || !ArcSidebarOn()) return;
+                                   for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d;
+                                        d = muxm::VisualTreeHelper::GetParent(d)) {
+                                       if (d.try_as<muxc::Primitives::ButtonBase>()) return;  // ☆ / ⋯
+                                       if (d == sender) break;
+                                   }
+                                   OpenCommandBar();
+                               })),
+                               true);
+    }
+    else MoveInto(st, address, url, {0, 0, 0, 0}, mux::HorizontalAlignment::Stretch);
     address.Visibility(mux::Visibility::Visible);
     st.source = winrt::make_weak(active);
     st.swapped = true;
@@ -4575,10 +5326,13 @@ static const double kCommandBarWidth = 600;
 static thread_local std::set<InstanceHandle> t_popoverHooked;
 
 static mux::FrameworkElement ArcPill(const mux::XamlRoot& root) {
-    for (auto& [h, st] : t_arc)
+    for (auto& [h, st] : t_arc) {
+        if (auto url = st.url.get().try_as<mux::FrameworkElement>(); url && st.address.get() && url.XamlRoot() == root)
+            return url;
         for (auto& m : st.moved)
             if (auto el = m.el.get().try_as<mux::FrameworkElement>(); el && el.Name() == L"AssistantBarHost" && el.XamlRoot() == root)
                 return el;
+    }
     return nullptr;
 }
 
@@ -5021,6 +5775,13 @@ static std::wstring SiteOf(std::wstring t) {
         t = t.substr(scheme + 3);
         t = t.substr(0, t.find_first_of(L"/?#"));
         if (size_t at = t.find(L'@'); at != std::wstring::npos) t = t.substr(at + 1);
+    } else if (t.find(L' ') == std::wstring::npos) {
+        // Some pages Dia shows as a bare address with no title ("google.com/?zx=123"): just the host too.
+        size_t cut = t.find_first_of(L"/?#");
+        if (cut != std::wstring::npos && cut > 0) {
+            std::wstring host = t.substr(0, cut);
+            if (host.find(L'.') != std::wstring::npos || host.rfind(L"localhost", 0) == 0) t = host;
+        }
     }
     if (t.rfind(L"www.", 0) == 0) t = t.substr(4);
     return t;
@@ -5313,6 +6074,9 @@ static void BuildArcWin(ArcWinBar& b, const muxc::Grid& group) {
 struct ArcWinHeader {
     winrt::weak_ref<muxc::Grid> header;        // Dia's WindowDragHeader
     winrt::weak_ref<muxc::StackPanel> panel;   // ours, after the logo: holds the toggle
+    // Dia's profile name (HeaderContentHost, with more than one profile), moved past the toggle: Dia's margin.
+    winrt::weak_ref<mux::FrameworkElement> name;
+    mux::Thickness nameMargin{};
 };
 static thread_local std::vector<ArcWinHeader> t_arcWinHeaders;
 
@@ -5320,6 +6084,8 @@ static void PutBackArcWinHeaders() {
     for (auto& s : t_arcWinHeaders) {
         auto header = s.header.get();
         auto panel = s.panel.get();
+        if (auto name = s.name.get()) name.Margin(s.nameMargin);
+        s.name = nullptr;
         if (!header || !panel) continue;
         uint32_t i;
         if (header.Children().IndexOf(panel, i)) header.Children().RemoveAt(i);
@@ -5358,6 +6124,24 @@ static void UpdateArcWinHeaders() {
         } catch (...) {
         }
         if (std::abs(panel.Margin().Left - x) > 0.5) panel.Margin({x, 0, 0, 0});
+        // With more than one profile Dia shows its name in the header's middle column, which starts
+        // where the toggle now sits: move the name past the toggle (as the Arc sidebar header does).
+        auto name = FindByName(header, L"HeaderContentHost");
+        if (name && s->name.get() != name) {
+            if (auto old = s->name.get()) old.Margin(s->nameMargin);
+            s->name = winrt::make_weak(name);
+            s->nameMargin = name.Margin();
+        }
+        if (name) {
+            double colStart = 0;
+            auto defs = header.ColumnDefinitions();
+            int col = muxc::Grid::GetColumn(name);
+            for (int i = 0; i < col && i < (int)defs.Size(); i++) colStart += defs.GetAt(i).ActualWidth();
+            double end = panel.Children().Size() && panel.ActualWidth() > 0 ? x + panel.ActualWidth() + 6 : 0;
+            auto m = s->nameMargin;
+            m.Left = (std::max)(m.Left, end - colStart);
+            if (std::abs(name.Margin().Left - m.Left) > 0.5) name.Margin(m);
+        }
     }
     t_arcWinHeaders.erase(std::remove_if(t_arcWinHeaders.begin(), t_arcWinHeaders.end(),
                                          [](const ArcWinHeader& x) { return !x.header.get() || !x.panel.get(); }),
@@ -5889,6 +6673,7 @@ void Ui_OpenInNewTab(const std::wstring& text) {
 static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     try {
         if (msg == WM_ARC_CTRL_T) {
+            Log("arc: Ctrl+T -> floating new tab bar");
             StartNewTabMode();
         } else if (msg == WM_ARC_ENTER) {
             // The hook went by a flag up to a tick old: focus left the box since, so give the Enter back.
@@ -5957,6 +6742,8 @@ static void SetArcKeys(bool on) {
     } else if (!g_arcHooks.Start(nullptr, ArcKeyHook)) {
         failed = true;
         Log("Arc keys: hook failed %lu", g_arcHooks.Error());
+    } else {
+        Log("Arc keys: hook on");
     }
 }
 
@@ -5964,6 +6751,120 @@ static void SetArcKeys(bool on) {
 static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
     g_arcEnterSubmits = t_newTabMode && !t_clearToken;  // (the box is focused: just checked)
+}
+
+// The sidebar's "+ New tab" button does what Ctrl+T does: with Floating New Tab on, the floating bar
+// (as in Arc, where the button and Ctrl+T are the same thing), not a New Tab page. It's Dia's unnamed
+// Button right in the tab list's RowsPanel (after the pinned / today / tab rows). Dia's own click is
+// stopped by taking the press's pointer capture away (a Button only clicks when the press it captured
+// ends on it), so no tab is made; the release then opens the bar. Checked on every press, so turning
+// the patch off gives the button back to Dia straight away. Keyboard (Space / Enter on it) stays Dia's.
+static thread_local std::vector<winrt::weak_ref<muxc::Button>> t_newTabButtons;
+static thread_local winrt::weak_ref<muxc::Button> t_newTabPress;
+
+// Arc modes: the window moves only from the top, as in Arc. Dia also moves it when you drag empty space
+// in the sidebar (its header row included), by moving the window itself on each pointer move (laggy,
+// the window trails the pointer). That starts from a press Dia handles at the sidebar's border or above
+// it; a press on empty space reaches there unhandled. Marked handled lower down, in the space pages'
+// scroll viewer, Dia's handler never sees it. The header row's gaps (logo, toggle, name, ← → ↻) are
+// registered as caption areas instead (ArcWinDragRects), so there Windows itself moves the window, as on
+// a title bar: smooth, with snapping. Presses on tabs, buttons, boxes (anything with a press of its own)
+// go through.
+static thread_local std::set<void*> t_noDragSidebars;
+
+// 0: not empty space (a tab, button, box...), 1: empty sidebar space, 2: empty space in the header row.
+// (The header's gaps have no background: a press there lands on the space pages' own grid, so the row
+// is found by where the press is, not by what was hit.)
+static int PressOnEmptySidebar(const mux::DependencyObject& source, const mux::UIElement& sv,
+                               mux::Input::PointerRoutedEventArgs const& e) {
+    for (auto d = source; d && d != sv; d = muxm::VisualTreeHelper::GetParent(d))
+        if (d.try_as<muxc::Primitives::ButtonBase>() || d.try_as<muxc::UserControl>() || d.try_as<muxc::TextBox>() ||
+            d.try_as<muxc::RichEditBox>() || d.try_as<muxc::Primitives::ScrollBar>() || d.try_as<muxc::Primitives::Thumb>())
+            return 0;
+    int kind = 1;
+    FirstIn(sv, [&](const mux::FrameworkElement& fe) {
+        if (fe.Name() != L"WindowDragHeader" || !ShownOnScreen(fe)) return false;
+        auto p = e.GetCurrentPoint(fe).Position();
+        if (p.X >= 0 && p.Y >= 0 && p.X < fe.ActualWidth() && p.Y < fe.ActualHeight()) kind = 2;
+        return kind == 2;
+    });
+    return kind;
+}
+
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+static void UpdateSidebarNoDrag() {
+    if (!ArcSidebarOn() && !ArcWindowsOn()) return;  // (checked again on each press: off gives Dia its drag back)
+    for (auto h : FindNodes(L"SpacesScrollViewer")) {
+        auto sv = Obj<mux::UIElement>(h);
+        if (!sv || !t_noDragSidebars.insert(winrt::get_abi(sv)).second) continue;
+        sv.AddHandler(
+            mux::UIElement::PointerPressedEvent(),
+            winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                try {
+                    if (e.Handled() || (!ArcSidebarOn() && !ArcWindowsOn())) return;
+                    auto sv = s.try_as<mux::UIElement>();
+                    if (!sv || !e.GetCurrentPoint(sv).Properties().IsLeftButtonPressed()) return;
+                    auto src = e.OriginalSource().try_as<mux::DependencyObject>();
+                    int kind = src ? PressOnEmptySidebar(src, sv, e) : 0;
+                    if (!kind) return;
+                    e.Handled(true);
+                } catch (...) {
+                }
+            })),
+            true);
+        Log("arc: sidebar no longer drags the window");
+    }
+}
+
+static void HookSidebarNewTabButtons() {
+    if (!Engine_TweakOn(L"floatingNewTab")) return;
+    std::erase_if(t_newTabButtons, [](auto& w) { return !w.get(); });
+    for (auto h : FindNodes(L"RowsPanel")) {
+        auto rows = Obj<muxc::StackPanel>(h);
+        if (!rows) continue;
+        for (auto const& c : rows.Children()) {
+            auto btn = c.try_as<muxc::Button>();
+            if (!btn) continue;
+            bool known = false;
+            for (auto& w : t_newTabButtons)
+                if (w.get() == btn) known = true;
+            if (known) continue;
+            t_newTabButtons.push_back(winrt::make_weak(btn));
+            btn.AddHandler(
+                mux::UIElement::PointerPressedEvent(),
+                winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                    try {
+                        auto b = s.try_as<muxc::Button>();
+                        if (!b || !Engine_TweakOn(L"floatingNewTab")) return;
+                        if (!e.GetCurrentPoint(b).Properties().IsLeftButtonPressed()) return;
+                        b.ReleasePointerCaptures();  // no capture, no Click: Dia makes no tab
+                        e.Handled(true);
+                        t_newTabPress = winrt::make_weak(b);
+                    } catch (...) {
+                    }
+                })),
+                true);
+            btn.AddHandler(
+                mux::UIElement::PointerReleasedEvent(),
+                winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) {
+                    try {
+                        auto b = s.try_as<muxc::Button>();
+                        if (!b || t_newTabPress.get() != b) return;
+                        t_newTabPress = nullptr;
+                        if (!Engine_TweakOn(L"floatingNewTab")) return;
+                        auto p = e.GetCurrentPoint(b).Position();
+                        if (p.X < 0 || p.Y < 0 || p.X >= b.ActualWidth() || p.Y >= b.ActualHeight()) return;
+                        e.Handled(true);
+                        Log("arc: sidebar New tab -> floating new tab bar");
+                        StartNewTabMode();
+                    } catch (...) {
+                    }
+                })),
+                true);
+            Log("arc: sidebar New tab button hooked");
+        }
+    }
 }
 
 // ---------------------------------------------------------------- window buttons (minimize/maximize/close)
@@ -5997,8 +6898,8 @@ void ProbeRegions(std::ostringstream& o) {
     for (auto& [h, c] : t_caption) {
         if (!c.src) continue;
         o << "pageLeft=" << c.pageLeft << " trimmed=" << c.captionTrimmed << "\n";
-        const char* names[] = {"Caption", "Close", "Maximize", "Minimize", "Icon", "TopBorder", "LeftBorder",
-                               "BottomBorder", "RightBorder", "Passthrough"};
+        const char* names[] = {"Close", "Maximize", "Minimize", "Icon", "Caption", "TopBorder", "LeftBorder",
+                               "BottomBorder", "RightBorder", "Passthrough"};  // (NonClientRegionKind's order)
         for (int k = 0; k <= 9; k++) {
             auto rects = c.src.GetRegionRects((mui::NonClientRegionKind)k);
             if (!rects.size()) continue;
@@ -6320,6 +7221,8 @@ static void OnRendering(wf::IInspectable const&, wf::IInspectable const&) {
         if (!a.gpu) ApplyOffset(a, h, false);
         any = true;
     }
+    for (auto& [h, st] : t_arc)
+        if (st.address.get()) FlushArcTrailing(st);
     if (!any) EnsureRendering(false);
 }
 
@@ -6395,7 +7298,11 @@ static void UpdateHiddenToolbar() {
         extern bool Tidy_Quiet();
         // Typing in the address bar (Ctrl+L) keeps it out; not while Tidy Tabs works its hidden chat (its
         // Chat button, in the toolbar, takes focus as the chat opens and gets it back as it closes).
-        bool focused = barEl && FocusWithin(barEl) && !Tidy_Quiet();
+        bool pillFocus = false;  // ☆ / ⋯ drawn in the sidebar are still in this toolbar
+        for (auto& [h, st] : t_arc)
+            if (auto address = st.address.get(); address && address.XamlRoot() == group.XamlRoot() && FocusWithin(address))
+                pillFocus = true;
+        bool focused = barEl && FocusWithin(barEl) && !pillFocus && !Tidy_Quiet();
         bool want = !hide || show || focused;
         double h = BarHeight(a);
         double target = want ? 0 : -h;
@@ -6523,12 +7430,40 @@ static HWND TopWindowFor(const mux::XamlRoot& root) {
 
 HWND Ui_TopWindowFor(const mux::XamlRoot& root) { return TopWindowFor(root); }  // (media.cpp)
 
-// The strip's empty space, in window pixels: the strip minus its left buttons, the centered group and
-// its right buttons. That's what drags the window, as in Arc's title bar.
+// The empty space that drags the window, in window pixels, as in Arc's title bar: in Arc (Windows) the
+// strip minus its left buttons, the centered group and its right buttons; in both Arc modes the sidebar's
+// header row (logo, toggle, name, ← → ↻) minus its buttons and the name.
 static std::vector<winrt::Windows::Graphics::RectInt32> ArcWinDragRects(const mux::XamlRoot& root) {
     std::vector<winrt::Windows::Graphics::RectInt32> out;
-    if (!ArcWindowsOn() || !root) return out;
+    if (!root || (!ArcWindowsOn() && !ArcSidebarOn())) return out;
     double sc = root.RasterizationScale();
+    for (auto h : FindNodes(L"WindowDragHeader")) {
+        auto header = Obj<mux::FrameworkElement>(h);
+        if (!header || header.XamlRoot() != root || !ShownOnScreen(header) || header.ActualWidth() <= 0) continue;
+        auto at = header.TransformToVisual(nullptr).TransformPoint({0, 0});
+        if (at.X + header.ActualWidth() <= 0 || at.Y + header.ActualHeight() <= 0) continue;
+        std::vector<std::pair<double, double>> taken;
+        FirstIn(header, [&](const mux::FrameworkElement& fe) {
+            bool hit = fe.try_as<muxc::Primitives::ButtonBase>() || fe.Name() == L"TitleTextPresenter";
+            if (hit && fe.Visibility() == mux::Visibility::Visible && fe.ActualWidth() > 0 && ShownOnScreen(fe)) {
+                double x = fe.TransformToVisual(nullptr).TransformPoint({0, 0}).X;
+                taken.push_back({x - 2, x + fe.ActualWidth() + 2});
+            }
+            return false;
+        });
+        std::sort(taken.begin(), taken.end());
+        double x = at.X, end = at.X + header.ActualWidth(), top = (std::max)(0.0, (double)at.Y), bottom = at.Y + header.ActualHeight();
+        auto add = [&](double l, double r) {
+            if (r - l < 4) return;
+            out.push_back({(int)std::ceil(l * sc), (int)std::floor(top * sc), (int)std::floor((r - l) * sc), (int)std::floor((bottom - top) * sc)});
+        };
+        for (auto& [l, r] : taken) {
+            if (l > x) add(x, (std::min)(l, end));
+            x = (std::max)(x, r);
+        }
+        if (x < end) add(x, end);
+    }
+    if (!ArcWindowsOn()) return out;
     for (auto& [h, b] : t_arcWin) {
         auto bar = b.toolbar.get();
         if (!bar || bar.XamlRoot() != root || !ShownOnScreen(bar) || bar.ActualWidth() <= 0) continue;
@@ -6620,7 +7555,7 @@ static void UpdateCaptionTrim() {
         } else
             UntrimCaption(c);
         if (top) TrimSink(top, hiddenBar, c.pageLeft);
-        if (!hiddenBar) UpdateArcWinCaption(c, root);
+        UpdateArcWinCaption(c, root);  // (the sidebar header's drag areas too, toolbar hidden or not)
     }
 }
 
@@ -6745,10 +7680,12 @@ bool Ui_Tick() {
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";
         UpdateNewTabMode();
+        if (tick % 4 == 0) HookSidebarNewTabButtons(), UpdateSidebarNoDrag();
         stage = "peek";
         Peek_Tick();
         stage = "hoverCards";
         UpdateHoverCards();
+        if (tick % 3 == 1) stage = "pinnedTabs", UpdatePinnedTabs(), UpdatePinnedMarks();
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
