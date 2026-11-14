@@ -8538,6 +8538,40 @@ static void GlueCaptionButtons(const mux::FrameworkElement& grid, double height)
     }
 }
 
+// The window buttons are drawn above the toolbar strip: their branch of the window's tree comes after the
+// one holding the page and its toolbar. Since Dia 1.7 the page's branch can end up painted above them
+// (a higher z-index), and the shown toolbar then covers the buttons: they still work (the clicks go to
+// their non-client regions) but can't be seen. Put the buttons' branch back just above the page's.
+static void KeepCaptionAbove(const mux::FrameworkElement& grid, const mux::FrameworkElement& bar) {
+    if (!grid || !bar) return;
+    std::vector<mux::DependencyObject> barChain;
+    for (mux::DependencyObject d = bar; d; d = muxm::VisualTreeHelper::GetParent(d)) barChain.push_back(d);
+    mux::DependencyObject mine = grid;
+    for (auto parent = muxm::VisualTreeHelper::GetParent(mine); parent;
+         mine = parent, parent = muxm::VisualTreeHelper::GetParent(parent)) {
+        auto it = std::find(barChain.begin(), barChain.end(), parent);
+        if (it == barChain.end()) continue;
+        if (it == barChain.begin()) return;  // (the buttons inside the toolbar: nothing to do)
+        auto panel = parent.try_as<muxc::Panel>();
+        auto myLayer = mine.try_as<mux::UIElement>();
+        auto barLayer = (*std::prev(it)).try_as<mux::UIElement>();
+        if (!panel || !myLayer || !barLayer) return;
+        uint32_t myIndex = 0, barIndex = 0;
+        panel.Children().IndexOf(myLayer, myIndex);
+        panel.Children().IndexOf(barLayer, barIndex);
+        int myZ = muxc::Canvas::GetZIndex(myLayer), barZ = muxc::Canvas::GetZIndex(barLayer);
+        bool covered = barZ > myZ || (barZ == myZ && barIndex > myIndex);
+        if (!covered) return;
+        static thread_local bool logged = false;
+        if (!logged) {
+            logged = true;
+            Log("window buttons: under the page (z %d at %u, page z %d at %u): raised", myZ, myIndex, barZ, barIndex);
+        }
+        muxc::Canvas::SetZIndex(myLayer, barZ + 1);
+        return;
+    }
+}
+
 // For the "Hide window buttons" tweak (no animation) and for windows with no hidden toolbar.
 static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkElement&)>& toolbarHidden) {
     FindCaptions();
@@ -8551,6 +8585,10 @@ static void UpdateCaptionButtons(const std::function<bool(const mux::FrameworkEl
         for (auto bh : FindNodes(L"NavigationBarHost"))
             if (auto bar = Obj<mux::FrameworkElement>(bh); bar && bar.XamlRoot() == root && bar.ActualHeight() > 1) {
                 barH = bar.ActualHeight();
+                try {
+                    KeepCaptionAbove(fe, bar);
+                } catch (...) {
+                }
                 break;
             }
         GlueCaptionButtons(fe, barH);
