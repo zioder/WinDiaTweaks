@@ -6,9 +6,10 @@
 // The preview is Dia's own page: Dia's engine, your profile, sign-ins and extensions.
 //   * Dia opens the link the way it does for Shift+click (in a new window). That window is caught as Dia
 //     creates it (a CBT hook on the UI thread: all of Dia's windows live on it). It is never seen until its
-//     page is ready: made far below the screen (WinUI draws a default frame for a new window, whatever
-//     its region), clipped to an empty window region, without frame or shadow, and the hiding is put back
-//     after every message WinUI handles for it (a thread hook) and whenever it's shown. It's held at the
+//     page is ready: made far off the screen, on the side whose nearest monitor is the card's, so its page
+//     is laid out at the card's DPI (WinUI draws a default frame for a new window, whatever its region),
+//     clipped to an empty window region, without frame or shadow, and the hiding is put back after every
+//     message WinUI handles for it (a thread hook) and whenever it's shown. It's held at the
 //     size that puts its page exactly on the card, kept from maximizing and resizing.
 //   * Dia draws a page inside its own WinUI window (its Chromium windows only take input: the pixels are
 //     composed into Dia's window), so the page can't be moved out: the window is the preview. Once its page
@@ -86,7 +87,9 @@ const UINT kHoldMs = 400;
 const ULONGLONG kDiaTimeoutMs = 5000;
 const ULONGLONG kNoWindowMs = 1500, kRetryMs = 700;  // Dia opened no window for the click (not a link after all)
 const ULONGLONG kSettleMs = 100, kRevealByMs = 2500;  // page in place this long before it's shown; at the latest
-const int kParkY = 30000;  // Dia's window is made this far below the screen (see above)
+// Dia's window is made far off the screen (see above): its page's edge this far out (see ParkOffset).
+// (Below 32767: Windows packs a window's position into 16 bits in places.)
+const int kParkAt = 25000;
 const ULONG_PTR kReplayTag = 0x4454504B;  // our own injected input ("DTPK"), which the hooks let through
 
 // The card and its motion.
@@ -128,7 +131,8 @@ struct Peek {
     HWND widget = nullptr;   // its page's Chromium window, once shown
     int aligns = 0;          // tries to land its page on the target
     bool pageSeen = false;
-    bool parked = true;      // below the screen (see kParkY)
+    bool parked = true;      // off the screen, moved by park (see ParkOffset)
+    POINT park{0, kParkAt};
     ULONGLONG placedAt = 0;  // when its page landed on the target
     RECT sizedTo{}, pageWhenSized{};  // the window's last resize, and its page then (see AlignPage)
     ULONGLONG sampledAt = 0;          // the page's last look (see HasContent)
@@ -162,6 +166,32 @@ HWND g_clickWidget = nullptr;
 std::atomic<ULONGLONG> g_lastMove{0};  // when the pointer last moved
 
 Peek* g_peek = nullptr;
+
+// Where Dia's window waits off the screen while its page loads: the target moved this far. Windows gives a
+// window the DPI of the monitor nearest to it, and Dia lays the page out at the DPI its window is made at,
+// so it must wait on the side of the screen whose nearest monitor is the one the target is on: parked
+// below a monitor with another scale, the page came out larger or smaller than the one behind it (#70).
+// Tried below, above, right, left; with monitors all around (none of them works), below.
+POINT ParkOffset(const RECT& t) {
+    HMONITOR home = MonitorFromRect(&t, MONITOR_DEFAULTTONEAREST);
+    const POINT tries[] = {{0, kParkAt - t.top}, {0, -kParkAt - t.bottom}, {kParkAt - t.left, 0}, {-kParkAt - t.right, 0}};
+    for (POINT d : tries) {
+        RECT r = t;
+        OffsetRect(&r, d.x, d.y);
+        if (MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST) == home) return d;
+    }
+    Log("peek: no side of the screen is nearest to this monitor: parked below");
+    return tries[0];
+}
+
+// Whether a window at (x, y) has been moved back from where it's parked (toward the screen).
+bool Unparked(const Peek* p, int x, int y) {
+    if (p->park.y > 0) return y < kParkAt / 2;
+    if (p->park.y < 0) return y > -kParkAt / 2;
+    if (p->park.x > 0) return x < kParkAt / 2;
+    return x > -kParkAt / 2;
+}
+
 // What the input hooks need of g_peek, which only the UI thread may read: set by Publish.
 std::atomic<bool> g_hasPeek{false}, g_peekWarm{false};
 std::atomic<int> g_peekPhase{0}, g_peekInject{0};
@@ -2016,14 +2046,14 @@ LRESULT CALLBACK FixedProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWO
     return DefSubclassProc(h, msg, wp, lp);
 }
 
-// Moves and sizes Dia's window so that its page covers the target exactly (below the screen while
+// Moves and sizes Dia's window so that its page covers the target exactly (off the screen while
 // parked). Dia lays the page out again after a resize (on a later message), so this measures, corrects,
 // and says whether it's there yet.
 bool AlignPage(Peek* p, HWND page) {
     RECT wr, pr;
     if (!GetWindowRect(p->win, &wr) || !GetWindowRect(page, &pr)) return false;
     RECT t = p->target;
-    if (p->parked) OffsetRect(&t, 0, kParkY);
+    if (p->parked) OffsetRect(&t, p->park.x, p->park.y);
     if (std::abs(pr.left - t.left) <= 2 && std::abs(pr.top - t.top) <= 2 && std::abs(pr.right - t.right) <= 2 &&
         std::abs(pr.bottom - t.bottom) <= 2)
         return true;
@@ -2771,8 +2801,8 @@ LRESULT CALLBACK AfterHook(int code, WPARAM wp, LPARAM lp) {
         if (m->hwnd == g_peek->win) {
             if (g_peek->parked && m->message == WM_WINDOWPOSCHANGED) {
                 RECT wr;
-                if (GetWindowRect(m->hwnd, &wr) && wr.top < kParkY / 2)
-                    SetWindowPos(m->hwnd, nullptr, wr.left, wr.top + kParkY, 0, 0,
+                if (GetWindowRect(m->hwnd, &wr) && Unparked(g_peek, wr.left, wr.top))
+                    SetWindowPos(m->hwnd, nullptr, wr.left + g_peek->park.x, wr.top + g_peek->park.y, 0, 0,
                                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             switch (m->message) {
@@ -2793,7 +2823,7 @@ LRESULT CALLBACK AfterHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 // Before Dia's window handles a move (WinUI places a new window where it likes, and DWM can draw a frame
-// of it there before AfterHook sends it back): while it's parked, the move itself is kept below the screen,
+// of it there before AfterHook sends it back): while it's parked, the move itself is kept off the screen,
 // and its hiding is put back before it's shown.
 // It also keeps the preview from being sized or moved by a drag (its edges, wherever WinUI or Chromium
 // starts one): during a drag, its size and place stay as they are.
@@ -2810,7 +2840,8 @@ LRESULT CALLBACK BeforeHook(int code, WPARAM wp, LPARAM lp) {
                 auto* pos = reinterpret_cast<WINDOWPOS*>(m->lParam);
                 if (g_dragging) pos->flags |= SWP_NOSIZE | SWP_NOMOVE;
                 if (!g_peek->widget) {
-                    if (g_peek->parked && !(pos->flags & SWP_NOMOVE) && pos->y < kParkY / 2) pos->y += kParkY;
+                    if (g_peek->parked && !(pos->flags & SWP_NOMOVE) && Unparked(g_peek, pos->x, pos->y))
+                        pos->x += g_peek->park.x, pos->y += g_peek->park.y;
                     if (pos->flags & SWP_SHOWWINDOW) KeepHidden(m->hwnd);
                 }
             }
@@ -2825,7 +2856,7 @@ void CALLBACK OnShow(HWINEVENTHOOK, DWORD, HWND w, LONG obj, LONG, DWORD, DWORD)
     KeepHidden(w);
 }
 
-// Dia's new window for the link: made below the screen at the size that puts its page on the target,
+// Dia's new window for the link: made off the screen at the size that puts its page on the target,
 // hidden as it's made (see AfterHook), kept from maximizing.
 ULONGLONG g_discardUntil = 0;  // a warm load was dropped: Dia's window for it, if it still comes, is closed unseen
 
@@ -2835,7 +2866,7 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wp, LPARAM lp) {
         auto* c = reinterpret_cast<CBT_CREATEWNDW*>(lp);
         if (!(c->lpcs->style & WS_CHILD) && ClassIs(h, L"WinUIDesktopWin32WindowClass")) {
             g_discardUntil = 0;
-            c->lpcs->y += kParkY;
+            c->lpcs->y += kParkAt;
             HideWindow(h);
             PostMessageW(h, WM_CLOSE, 0, 0);
             return CallNextHookEx(nullptr, code, wp, lp);
@@ -2863,8 +2894,8 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wp, LPARAM lp) {
             Ui_SetPeekWindow(h);  // (its toolbar is left as Dia lays it out: see ui.cpp)
             HideWindow(h);
             const RECT& t = p->target;
-            c->lpcs->x = t.left - g_offset.dx;
-            c->lpcs->y = t.top - g_offset.dy + kParkY;
+            c->lpcs->x = t.left - g_offset.dx + p->park.x;
+            c->lpcs->y = t.top - g_offset.dy + p->park.y;
             c->lpcs->cx = t.right - t.left + g_offset.dw;
             c->lpcs->cy = t.bottom - t.top + g_offset.dh;
             Log("peek: Dia window after %llu ms", GetTickCount64() - p->started);
@@ -2917,7 +2948,7 @@ void DiaTick() {
         // Dia gives a new window its own size after making it: keep it at the size that puts its page on
         // the target (learned from the last one), so the page is laid out once, at its size.
         RECT t = p->target;
-        if (p->parked) OffsetRect(&t, 0, kParkY);
+        if (p->parked) OffsetRect(&t, p->park.x, p->park.y);
         RECT want{t.left - g_offset.dx, t.top - g_offset.dy, t.right - g_offset.dx + g_offset.dw,
                   t.bottom - g_offset.dy + g_offset.dh}, wr;
         if (GetWindowRect(p->win, &wr) && !EqualRect(&wr, &want))
@@ -2930,14 +2961,17 @@ void DiaTick() {
         }
         return;
     }
-    if (p->cloaked) {  // (it has a page: drawn from here on, still below the screen and clipped to nothing)
+    if (p->cloaked) {  // (it has a page: drawn from here on, still off the screen and clipped to nothing)
         KeepHidden(p->win);
         Cloak(p->win, false);
         p->cloaked = false;
     }
     if (!p->pageSeen) {
         p->pageSeen = true;
-        Log("peek: page window after %llu ms", age);
+        // (its DPI, parked, is the one its page is laid out at: it must be Dia's, or the page is scaled)
+        UINT dpi = GetDpiForWindow(p->win), diaDpi = GetDpiForWindow(p->dia);
+        Log("peek: page window after %llu ms (DPI %u, Dia's %u%s)", age, dpi, diaDpi,
+            dpi == diaDpi ? "" : ": the page will look scaled");
     }
     p->aligns++;
     ULONGLONG now = GetTickCount64();
@@ -2947,7 +2981,7 @@ void DiaTick() {
         p->parked = false;
         RECT wr;
         GetWindowRect(p->win, &wr);
-        SetWindowPos(p->win, nullptr, wr.left, wr.top - kParkY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(p->win, nullptr, wr.left - p->park.x, wr.top - p->park.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         p->placedAt = now;
         return;
     }
@@ -3070,6 +3104,7 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
     p->dia = dia;
     p->page = page;
     p->target = target;
+    p->park = ParkOffset(target);
     p->pageArea = pr;
     p->origin = click;
     p->url = url;
