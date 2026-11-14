@@ -26,6 +26,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | **Page** | |
 | Edge-to-edge web content | Removes the gap between pages and the window edge |
 | Square corners by the sidebar | Pages meet the sidebar and window edges with straight corners |
+| Hide link address ✨ | Hides the address Dia shows at the bottom left while the pointer is over a link |
 | **Toolbar** | |
 | Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
@@ -46,7 +47,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
 | Hide tab hover card ✨ | Stops the card with the page title, site and buttons from popping up when you hover a tab or pinned tab |
-| Profile emoji | Shows an emoji for this profile at the top of the sidebar |
+| Profile Emojis | An emoji for each profile in place of its dot in the profile switcher, and at the top of the sidebar. Choose them in Settings › Profiles, when creating a profile, or by right-clicking a profile's dot |
 | Don't pop up downloads | Stops the downloads list from opening by itself for each download |
 | Translucent sidebar | Lets the page show through the sidebar when it floats over the page |
 | **Tidy Tabs** | |

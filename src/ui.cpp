@@ -39,6 +39,8 @@
 #include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.Shapes.h>
 #include <winrt/Microsoft.UI.Xaml.Documents.h>
+#include <winrt/Windows.Data.Json.h>
+#include <appmodel.h>
 
 #include <atomic>
 #include <fstream>
@@ -269,6 +271,35 @@ static void DescribeElement(std::ostringstream& o, const mux::FrameworkElement& 
     if (auto ui = fe.try_as<mux::UIElement>()) {
         if (auto tr = ui.RenderTransform().try_as<muxm::TranslateTransform>())
             o << " translate=" << tr.X() << "," << tr.Y();
+    }
+    try {  // what Dia attached to it: data item, accessible name, tooltip, Canvas position, icon glyph
+        if (auto dc = fe.DataContext()) {
+            o << " dc=" << N(std::wstring(winrt::get_class_name(dc)));
+            if (auto s = dc.try_as<winrt::Windows::Foundation::IStringable>()) o << "(\"" << N(std::wstring(s.ToString())) << "\")";
+        }
+        namespace ap = winrt::Microsoft::UI::Xaml::Automation;
+        if (auto an = ap::AutomationProperties::GetName(fe); !an.empty()) o << " aname=\"" << N(std::wstring(an)) << "\"";
+        if (auto ai = ap::AutomationProperties::GetAutomationId(fe); !ai.empty()) o << " aid=\"" << N(std::wstring(ai)) << "\"";
+        if (auto tt = muxc::ToolTipService::GetToolTip(fe)) {
+            o << " tooltip=" << N(std::wstring(winrt::get_class_name(tt)));
+            if (auto s = tt.try_as<wf::IReference<winrt::hstring>>()) o << "(\"" << N(std::wstring(s.Value())) << "\")";
+            else if (auto t = tt.try_as<muxc::ToolTip>())
+                if (auto c = t.Content().try_as<wf::IReference<winrt::hstring>>()) o << "(\"" << N(std::wstring(c.Value())) << "\")";
+        }
+        if (auto tg = fe.Tag()) o << " tag=" << N(std::wstring(winrt::get_class_name(tg)));
+        if (auto cf = fe.ContextFlyout()) {
+            o << " contextflyout=" << N(std::wstring(winrt::get_class_name(cf)));
+            if (auto mf = cf.try_as<muxc::MenuFlyout>()) o << "(" << mf.Items().Size() << " items)";
+        }
+        if (auto b = fe.try_as<muxc::Button>(); b && b.Flyout()) o << " flyout=" << N(std::wstring(winrt::get_class_name(b.Flyout())));
+        if (muxm::VisualTreeHelper::GetParent(fe).try_as<muxc::Canvas>())
+            o << " canvas=" << muxc::Canvas::GetLeft(fe) << "," << muxc::Canvas::GetTop(fe);
+        if (auto fi = fe.try_as<muxc::FontIcon>()) {
+            o << " glyph=";
+            for (wchar_t ch : std::wstring(fi.Glyph())) o << std::hex << "U+" << (int)ch << std::dec << " ";
+            o << "fontsize=" << fi.FontSize() << " font=\"" << N(std::wstring(fi.FontFamily().Source())) << "\"";
+        }
+    } catch (...) {
     }
     o << "\n";
 }
@@ -568,6 +599,8 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
             t_choiceSwitches.push_back({key, winrt::make_weak(box)});
         }
         controls.Children().Append(box);
+    } else if (key == L"profileEmoji") {
+        // (its option holds every profile's emoji: chosen in Settings > Profiles and the profile menu, not here)
     } else if (!t.value.empty()) {
         muxc::TextBox box;
         box.Text(t.value);
@@ -1899,20 +1932,68 @@ struct PageStretch {
     mux::Thickness saved{};
 };
 static thread_local std::vector<PageStretch> t_stretch;
+static thread_local std::vector<PageStretch> t_statusLift;  // link-hover bubbles raised above the overhang
 static thread_local bool t_sliding = false;  // the hidden toolbar is mid-slide; don't fight it
 static const double kCornerOverhang = 9;    // > Dia's 7px corner radius
+
+// The web page's host: Dia's ContentHost ContentControl. Other elements share the name, such as the
+// ContentPresenter in a MenuFlyoutSeparator's template (Dia's profile menu puts its color row there), so
+// match the type too: stretching or squaring those breaks the menu.
+static std::vector<mux::FrameworkElement> PageContentHosts() {
+    std::vector<mux::FrameworkElement> out;
+    for (auto h : FindNodes(L"ContentHost"))
+        if (auto fe = Obj<muxc::ContentControl>(h)) out.push_back(fe);
+    return out;
+}
+
+// The link address bubble Dia shows at the bottom left of the page sits inside the stretched page, so
+// the part that hangs past the window's bottom edge would be cut off: raise it by that much.
+static void LiftStatusBubbles(const std::vector<std::pair<mux::FrameworkElement, double>>& overhangs) {
+    for (auto h : FindNodes(L"StatusText")) {
+        auto tb = Obj<mux::FrameworkElement>(h);
+        if (!tb) continue;
+        auto bubble = muxm::VisualTreeHelper::GetParent(tb).try_as<mux::FrameworkElement>();
+        if (!bubble) continue;
+        double lift = 0;
+        for (mux::DependencyObject d = bubble; d; d = muxm::VisualTreeHelper::GetParent(d)) {
+            auto it = std::find_if(overhangs.begin(), overhangs.end(), [&](auto const& o) { return o.first == d; });
+            if (it != overhangs.end()) {
+                lift = it->second;
+                break;
+            }
+        }
+        PageStretch* st = nullptr;
+        for (auto& p : t_statusLift)
+            if (p.host.get() == bubble) st = &p;
+        if (!st) {
+            if (lift < 0.5) continue;
+            t_statusLift.push_back({winrt::make_weak(bubble), bubble.Margin()});
+            st = &t_statusLift.back();
+        }
+        auto m = st->saved;
+        m.Bottom += lift;
+        auto cur = bubble.Margin();
+        if (std::abs(cur.Bottom - m.Bottom) >= 0.5) bubble.Margin(m);
+    }
+    t_statusLift.erase(std::remove_if(t_statusLift.begin(), t_statusLift.end(),
+                                      [](const PageStretch& p) { return !p.host.get(); }),
+                       t_statusLift.end());
+}
 
 static void StretchPage(bool on) {
     if (!on) {
         for (auto& p : t_stretch)
             if (auto fe = p.host.get()) fe.Margin(p.saved);
         t_stretch.clear();
+        for (auto& p : t_statusLift)
+            if (auto fe = p.host.get()) fe.Margin(p.saved);
+        t_statusLift.clear();
         return;
     }
     if (t_sliding) return;
-    for (auto h : FindNodes(L"ContentHost")) {
-        auto fe = Obj<mux::FrameworkElement>(h);
-        if (!fe || fe.ActualHeight() < 1) continue;
+    std::vector<std::pair<mux::FrameworkElement, double>> overhangs;  // host -> how far it hangs past the window
+    for (auto const& fe : PageContentHosts()) {
+        if (fe.ActualHeight() < 1) continue;
         PageStretch* st = nullptr;
         for (auto& p : t_stretch)
             if (p.host.get() == fe) st = &p;
@@ -1924,12 +2005,17 @@ static void StretchPage(bool on) {
         if (!root) continue;
         double bottom = fe.TransformToVisual(root).TransformPoint({0, 0}).Y + fe.ActualHeight();
         double delta = root.ActualHeight() + kCornerOverhang - bottom;  // how far the page must still grow
-        if (std::abs(delta) < 0.5) continue;
-        auto m = fe.Margin();
-        m.Bottom -= delta;
-        if (m.Bottom > st->saved.Bottom) m.Bottom = st->saved.Bottom;  // never shrink the page
-        fe.Margin(m);
+        if (std::abs(delta) >= 0.5) {
+            auto old = fe.Margin();
+            auto m = old;
+            m.Bottom -= delta;
+            if (m.Bottom > st->saved.Bottom) m.Bottom = st->saved.Bottom;  // never shrink the page
+            fe.Margin(m);
+            bottom += old.Bottom - m.Bottom;
+        }
+        overhangs.emplace_back(fe, (std::max)(0.0, bottom - root.ActualHeight()));
     }
+    LiftStatusBubbles(overhangs);
 }
 
 static void UpdateSquareCorners() {
@@ -1952,7 +2038,7 @@ static void UpdateSquareCorners() {
         bool ok;
         if (fe && SmallRounded(GetRadius(fe, ok))) t_corners.push_back({winrt::make_weak(fe), GetRadius(fe, ok)}), SetRadius(fe, {0, 0, 0, 0});
     }
-    for (auto h : FindNodes(L"ContentHost")) SquareUnder(Obj<mux::DependencyObject>(h), 0);
+    for (auto const& fe : PageContentHosts()) SquareUnder(fe, 0);
     t_corners.erase(std::remove_if(t_corners.begin(), t_corners.end(), [](const CornerState& c) { return !c.el.get(); }),
                     t_corners.end());
 }
@@ -2043,29 +2129,521 @@ static void UpdateAddressField() {
     }
 }
 
-// --- Profile emoji: an emoji for this profile at the top of the sidebar.
-static thread_local std::vector<winrt::weak_ref<muxc::TextBlock>> t_emoji;
+// --- Profile emoji, after JaceThings/DiaTweaks' ProfileEmoji: an emoji for each profile in place of its
+// dot in the profile switcher at the bottom of the sidebar, and the current profile's at the top of the
+// sidebar. The option holds "Default=💼, Profile 3=🏠, 🙂": each profile by its folder in Dia's user data
+// (so it keeps its emoji when renamed), or by its name as Dia shows it (turned into the folder once Dia's
+// Local State says which one it is). An emoji without a profile is shown at the top for a profile that
+// has none of its own.
+// Each dot is a Button on a Canvas whose accessible name (and tooltip) is the profile's name; Dia draws
+// the current profile's dot larger (its FontIcon's FontSize: 6 against 4) and places the dots itself
+// (Canvas.Left, one 12 px slot each). Wider emoji slots are laid out in Dia's order and put straight back
+// whenever Dia moves a dot, before the frame is drawn. Dia's other row of dots (SpaceIndicatorsPanel, in
+// the header) stays empty on Windows, also while swiping between profiles.
+struct ProfileEmojiSet {
+    std::wstring fallback;
+    std::vector<std::pair<std::wstring, std::wstring>> byKey;  // profile folder (or name) -> emoji
+};
 
-static void UpdateProfileEmoji() {
-    bool on = Engine_TweakOn(L"profileEmoji");
-    std::wstring emoji = Engine_TweakValue(L"profileEmoji");
-    if (!on || emoji.empty()) {
-        for (auto& w : t_emoji)
-            if (auto tb = w.get())
-                if (auto parent = muxm::VisualTreeHelper::GetParent(tb).try_as<muxc::Panel>()) {
-                    uint32_t i;
-                    if (parent.Children().IndexOf(tb, i)) parent.Children().RemoveAt(i);
+static std::wstring TrimSpaces(std::wstring s) {
+    while (!s.empty() && iswspace(s.back())) s.pop_back();
+    size_t a = 0;
+    while (a < s.size() && iswspace(s[a])) a++;
+    return s.substr(a);
+}
+
+static bool SameText(const std::wstring& a, const std::wstring& b) { return !a.empty() && _wcsicmp(a.c_str(), b.c_str()) == 0; }
+
+static ProfileEmojiSet ParseProfileEmojis(const std::wstring& v) {
+    ProfileEmojiSet set;
+    for (size_t start = 0;;) {
+        size_t comma = v.find(L',', start);
+        std::wstring part = TrimSpaces(v.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start));
+        size_t eq = part.rfind(L'=');
+        if (eq == std::wstring::npos) {
+            if (!part.empty()) set.fallback = part;
+        } else {
+            std::wstring key = TrimSpaces(part.substr(0, eq)), emoji = TrimSpaces(part.substr(eq + 1));
+            if (!key.empty() && !emoji.empty()) set.byKey.push_back({key, emoji});
+        }
+        if (comma == std::wstring::npos) break;
+        start = comma + 1;
+    }
+    return set;
+}
+
+static std::wstring FormatProfileEmojis(const ProfileEmojiSet& set) {
+    std::wstring out;
+    for (auto& [key, emoji] : set.byKey) out += (out.empty() ? L"" : L", ") + key + L"=" + emoji;
+    if (!set.fallback.empty()) out += (out.empty() ? L"" : L", ") + set.fallback;
+    return out;
+}
+
+// A profile: its folder in Dia's user data (empty when unknown) and its name.
+struct DiaProfile {
+    std::wstring dir, name;
+};
+
+static std::wstring ProfileEmojiFor(const ProfileEmojiSet& set, const DiaProfile& p) {
+    for (auto& [k, e] : set.byKey)
+        if (SameText(k, p.dir)) return e;
+    for (auto& [k, e] : set.byKey)
+        if (SameText(k, p.name)) return e;
+    return {};
+}
+
+// Dia's profiles, from its Local State (Chromium's profile.info_cache): folder and name, in Dia's order.
+// Read again when the file changes (checked every 2 s at most). Shared by every UI thread.
+static std::mutex g_profilesLock;
+static std::vector<DiaProfile> g_diaProfiles;    // from Local State
+static std::vector<DiaProfile> g_switcherOrder;  // as the switcher shows them, left to right
+
+static std::vector<DiaProfile> DiaProfiles() {
+    std::lock_guard<std::mutex> lock(g_profilesLock);
+    static ULONGLONG lastCheck = 0;
+    static FILETIME lastWrite{};
+    static std::wstring path;
+    ULONGLONG now = GetTickCount64();
+    if (lastCheck && now - lastCheck < 2000) return g_diaProfiles;
+    lastCheck = now;
+    try {
+        WIN32_FILE_ATTRIBUTE_DATA fa{};
+        if (path.empty() || !GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa)) {
+            path.clear();
+            // Dia is packaged: its user data is in the package's LocalCache, which the process also sees
+            // at the usual %LOCALAPPDATA% path.
+            std::vector<std::wstring> tries;
+            if (const wchar_t* la = _wgetenv(L"LOCALAPPDATA")) {
+                tries.push_back(std::wstring(la) + L"\\Dia\\User Data\\Local State");
+                UINT32 n = 0;
+                if (GetCurrentPackageFamilyName(&n, nullptr) == ERROR_INSUFFICIENT_BUFFER && n) {
+                    std::wstring fam(n, L'\0');
+                    if (GetCurrentPackageFamilyName(&n, fam.data()) == ERROR_SUCCESS) {
+                        fam.resize(wcslen(fam.c_str()));
+                        tries.push_back(std::wstring(la) + L"\\Packages\\" + fam + L"\\LocalCache\\Local\\Dia\\User Data\\Local State");
+                    }
                 }
+            }
+            for (auto& t : tries)
+                if (GetFileAttributesExW(t.c_str(), GetFileExInfoStandard, &fa)) {
+                    path = t;
+                    break;
+                }
+            if (path.empty()) return g_diaProfiles;
+        }
+        if (CompareFileTime(&fa.ftLastWriteTime, &lastWrite) == 0) return g_diaProfiles;
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return g_diaProfiles;
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        namespace json = winrt::Windows::Data::Json;
+        json::JsonObject root{nullptr};
+        if (!json::JsonObject::TryParse(winrt::to_hstring(text), root)) return g_diaProfiles;
+        auto profile = root.GetNamedObject(L"profile", nullptr);
+        auto cache = profile ? profile.GetNamedObject(L"info_cache", nullptr) : nullptr;
+        if (!cache) return g_diaProfiles;
+        std::vector<DiaProfile> list;
+        auto add = [&](const std::wstring& dir) {
+            if (std::any_of(list.begin(), list.end(), [&](auto& p) { return p.dir == dir; })) return;
+            auto info = cache.GetNamedObject(dir, nullptr);
+            if (info) list.push_back({dir, std::wstring(info.GetNamedString(L"name", L""))});
+        };
+        if (auto order = profile.GetNamedArray(L"profiles_order", nullptr))
+            for (auto const& v : order)
+                if (v.ValueType() == json::JsonValueType::String) add(std::wstring(v.GetString()));
+        for (auto const& kv : cache) add(std::wstring(kv.Key()));
+        g_diaProfiles = list;
+        lastWrite = fa.ftLastWriteTime;
+    } catch (...) {
+    }
+    return g_diaProfiles;
+}
+
+// Folders for profiles known by name, in order (two profiles can share a name: each takes the next one).
+static std::vector<DiaProfile> ResolveProfiles(const std::vector<std::wstring>& names) {
+    auto known = DiaProfiles();
+    std::vector<bool> used(known.size());
+    std::vector<DiaProfile> out;
+    for (auto& n : names) {
+        DiaProfile p{L"", n};
+        for (size_t i = 0; i < known.size(); i++)
+            if (!used[i] && known[i].name == n) {
+                used[i] = true;
+                p.dir = known[i].dir;
+                break;
+            }
+        out.push_back(p);
+    }
+    return out;
+}
+
+static wf::IInspectable LocalValue(const mux::DependencyObject& d, const mux::DependencyProperty& dp) {
+    auto v = d.ReadLocalValue(dp);
+    return v == mux::DependencyProperty::UnsetValue() ? nullptr : v;
+}
+static void PutBack(const mux::DependencyObject& d, const mux::DependencyProperty& dp, const wf::IInspectable& v) {
+    if (v) d.SetValue(dp, v);
+    else d.ClearValue(dp);
+}
+
+// An emoji slot: room for the glyph and a gap, like upstream's (16 + 10).
+static constexpr double kPipEmojiWidth = 24, kPipEmojiSize = 14, kPipEmojiDim = 0.45;
+
+// One key per object, whichever of its interfaces a callback hands us (the raw pointer differs: a
+// Button and the DependencyObject a property callback gets are different interfaces of one object).
+static void* ObjectId(const wf::IInspectable& o) { return o ? winrt::get_abi(o.as<wf::IUnknown>()) : nullptr; }
+
+struct PipEmoji {
+    winrt::weak_ref<muxc::Button> button;
+    winrt::weak_ref<muxc::FontIcon> icon;
+    winrt::weak_ref<muxc::TextBlock> label;
+    winrt::weak_ref<muxc::Grid> root;  // the dot's RootGrid: 12 px wide and clipped to its round corners
+    std::wstring emoji;
+    std::wstring dir;     // its profile's folder, kept while Dia's Local State catches up with a rename
+    double slot = 12;     // Dia's width for a dot
+    double diaLeft = 0;   // where Dia put it
+    double ourLeft = -1, ourWidth = -1;
+    bool rootWidened = false;
+    wf::IInspectable diaWidth{nullptr}, diaIconOpacity{nullptr}, diaRootWidth{nullptr};  // Dia's own values, put back on off
+    int64_t leftToken = 0, widthToken = 0, sizeToken = 0;
+};
+struct SwitcherEmoji {
+    winrt::weak_ref<muxc::Canvas> canvas;
+    std::map<void*, PipEmoji> pips;
+    wf::IInspectable diaCanvasWidth{nullptr}, diaClip{nullptr};
+    double ourCanvasWidth = -1;
+    muxm::RectangleGeometry ourClip{nullptr};
+    int64_t canvasWidthToken = 0, clipToken = 0;
+    bool busy = false;
+    // The dot just clicked: shown as the current one straight away, not when Dia has finished switching
+    // (it makes its dot larger only then).
+    void* clicked = nullptr;
+    ULONGLONG clickedAt = 0;
+};
+static thread_local std::map<InstanceHandle, SwitcherEmoji> t_switcherEmoji;
+// Profile names the switcher showed with their folders (for the top of the sidebar, right after a rename).
+static thread_local std::map<std::wstring, std::wstring> t_profileDirByName;
+
+static void LayoutSwitcherEmoji(SwitcherEmoji& st);
+
+static void ForgetPip(PipEmoji& p) {
+    if (auto b = p.button.get()) {
+        if (p.leftToken) b.UnregisterPropertyChangedCallback(muxc::Canvas::LeftProperty(), p.leftToken);
+        if (p.widthToken) b.UnregisterPropertyChangedCallback(mux::FrameworkElement::WidthProperty(), p.widthToken);
+        if (p.ourLeft >= 0) muxc::Canvas::SetLeft(b, p.diaLeft);
+        if (p.ourWidth >= 0) PutBack(b, mux::FrameworkElement::WidthProperty(), p.diaWidth);
+    }
+    if (auto i = p.icon.get()) {
+        if (p.sizeToken) i.UnregisterPropertyChangedCallback(muxc::FontIcon::FontSizeProperty(), p.sizeToken);
+        PutBack(i, mux::UIElement::OpacityProperty(), p.diaIconOpacity);
+    }
+    if (auto r = p.root.get(); r && p.rootWidened) PutBack(r, mux::FrameworkElement::WidthProperty(), p.diaRootWidth);
+    if (auto l = p.label.get())
+        if (auto parent = muxm::VisualTreeHelper::GetParent(l).try_as<muxc::Panel>()) {
+            uint32_t i;
+            if (parent.Children().IndexOf(l, i)) parent.Children().RemoveAt(i);
+        }
+    p = {};
+}
+
+static void ForgetSwitcher(SwitcherEmoji& st) {
+    st.busy = true;
+    for (auto& [k, p] : st.pips) ForgetPip(p);
+    st.pips.clear();
+    if (auto c = st.canvas.get()) {
+        if (st.canvasWidthToken) c.UnregisterPropertyChangedCallback(mux::FrameworkElement::WidthProperty(), st.canvasWidthToken);
+        if (st.clipToken) c.UnregisterPropertyChangedCallback(mux::UIElement::ClipProperty(), st.clipToken);
+        if (st.ourCanvasWidth >= 0) PutBack(c, mux::FrameworkElement::WidthProperty(), st.diaCanvasWidth);
+        if (st.ourClip) PutBack(c, mux::UIElement::ClipProperty(), st.diaClip);
+    }
+    st = {};
+}
+
+static void AdoptPip(InstanceHandle h, PipEmoji& p, const muxc::Button& b) {
+    p.button = winrt::make_weak(b);
+    double w = b.Width();
+    p.slot = std::isfinite(w) && w > 0 ? w : (b.ActualWidth() > 0 ? b.ActualWidth() : 12);
+    p.diaLeft = muxc::Canvas::GetLeft(b);
+    p.diaWidth = LocalValue(b, mux::FrameworkElement::WidthProperty());
+    p.leftToken = b.RegisterPropertyChangedCallback(muxc::Canvas::LeftProperty(), [h](mux::DependencyObject const& o, auto&&) {
+        auto it = t_switcherEmoji.find(h);
+        if (it == t_switcherEmoji.end() || it->second.busy) return;
+        auto pi = it->second.pips.find(ObjectId(o));
+        if (pi == it->second.pips.end()) return;
+        double left = muxc::Canvas::GetLeft(o.as<mux::UIElement>());
+        if (std::abs(left - pi->second.ourLeft) < 0.01) return;
+        pi->second.diaLeft = left;  // Dia moved it (a profile added or removed)
+        LayoutSwitcherEmoji(it->second);
+    });
+    p.widthToken = b.RegisterPropertyChangedCallback(mux::FrameworkElement::WidthProperty(), [h](mux::DependencyObject const& o, auto&&) {
+        auto it = t_switcherEmoji.find(h);
+        if (it == t_switcherEmoji.end() || it->second.busy) return;
+        auto pi = it->second.pips.find(ObjectId(o));
+        if (pi == it->second.pips.end()) return;
+        pi->second.diaWidth = LocalValue(o, mux::FrameworkElement::WidthProperty());
+        LayoutSwitcherEmoji(it->second);
+    });
+    auto icon = FindVisual(b, [](mux::DependencyObject const& d) { return d.try_as<muxc::FontIcon>() != nullptr; }).try_as<muxc::FontIcon>();
+    if (icon) {
+        p.icon = winrt::make_weak(icon);
+        p.diaIconOpacity = LocalValue(icon, mux::UIElement::OpacityProperty());
+        // Dia makes the current profile's dot larger: dim the others' emoji, as soon as it does.
+        p.sizeToken = icon.RegisterPropertyChangedCallback(muxc::FontIcon::FontSizeProperty(), [h](auto&&, auto&&) {
+            auto it = t_switcherEmoji.find(h);
+            if (it == t_switcherEmoji.end()) return;
+            it->second.clicked = nullptr;  // Dia has caught up
+            LayoutSwitcherEmoji(it->second);
+        });
+    }
+    if (auto root = FindVisual(b, [](mux::DependencyObject const& d) { return d.try_as<muxc::Grid>() != nullptr; }).try_as<muxc::Grid>()) {
+        p.root = winrt::make_weak(root);
+        p.diaRootWidth = LocalValue(root, mux::FrameworkElement::WidthProperty());
+    }
+    b.Click([h](wf::IInspectable const& s, auto&&) {
+        auto it = t_switcherEmoji.find(h);
+        if (it == t_switcherEmoji.end()) return;
+        it->second.clicked = ObjectId(s);
+        it->second.clickedAt = GetTickCount64();
+        LayoutSwitcherEmoji(it->second);
+    });
+}
+
+static void LayoutSwitcherEmoji(SwitcherEmoji& st) {
+    auto canvas = st.canvas.get();
+    if (!canvas || st.busy) return;
+    st.busy = true;
+    try {
+        std::vector<PipEmoji*> row;
+        double maxSize = 0, minSize = 1e9;
+        for (auto& [k, p] : st.pips) {
+            if (!p.button.get()) continue;
+            row.push_back(&p);
+            if (auto i = p.icon.get()) maxSize = (std::max)(maxSize, i.FontSize()), minSize = (std::min)(minSize, i.FontSize());
+        }
+        std::stable_sort(row.begin(), row.end(), [](PipEmoji* a, PipEmoji* b) { return a->diaLeft < b->diaLeft; });
+        bool clickedValid = st.clicked && GetTickCount64() - st.clickedAt < 1500;
+        double x = 0, height = 0;
+        for (auto* p : row) {
+            auto b = p->button.get();
+            double w = p->emoji.empty() ? p->slot : kPipEmojiWidth;
+            if (std::abs(muxc::Canvas::GetLeft(b) - x) > 0.01) muxc::Canvas::SetLeft(b, x);
+            p->ourLeft = x;
+            if (!std::isfinite(b.Width()) || std::abs(b.Width() - w) > 0.01) b.Width(w);
+            p->ourWidth = w;
+            x += w;
+            height = (std::max)(height, b.ActualHeight());
+            auto icon = p->icon.get();
+            auto label = p->label.get();
+            auto root = p->root.get();
+            if (p->emoji.empty()) {
+                if (icon) PutBack(icon, mux::UIElement::OpacityProperty(), p->diaIconOpacity);
+                if (label) label.Visibility(mux::Visibility::Collapsed);
+                if (root && p->rootWidened) PutBack(root, mux::FrameworkElement::WidthProperty(), p->diaRootWidth), p->rootWidened = false;
+                continue;
+            }
+            if (icon && icon.Opacity() != 0) icon.Opacity(0);
+            // The emoji is wider than Dia's dot: widen the RootGrid too, or its round corners clip it.
+            if (root && (!std::isfinite(root.Width()) || std::abs(root.Width() - w) > 0.01)) root.Width(w), p->rootWidened = true;
+            if (!label) {
+                auto grid = root;
+                if (!grid) continue;
+                label = muxc::TextBlock();
+                label.Name(L"diatweaksPipEmoji");
+                label.FontFamily(muxm::FontFamily(L"Segoe UI Emoji"));
+                label.FontSize(kPipEmojiSize);
+                label.Foreground(muxm::SolidColorBrush(Rgba(255, 255, 255)));  // (Dia's dot color is see-through)
+                label.HorizontalAlignment(mux::HorizontalAlignment::Center);
+                label.VerticalAlignment(mux::VerticalAlignment::Center);
+                label.TextAlignment(mux::TextAlignment::Center);
+                label.IsHitTestVisible(false);
+                muxc::Grid::SetRowSpan(label, (std::max)(1, (int)grid.RowDefinitions().Size()));
+                muxc::Grid::SetColumnSpan(label, (std::max)(1, (int)grid.ColumnDefinitions().Size()));
+                grid.Children().Append(label);
+                p->label = winrt::make_weak(label);
+            }
+            if (label.Text() != p->emoji) label.Text(p->emoji);
+            if (label.Visibility() != mux::Visibility::Visible) label.Visibility(mux::Visibility::Visible);
+            bool current = clickedValid ? ObjectId(b) == st.clicked
+                                        : row.size() < 2 || maxSize - minSize < 0.01 || (icon && icon.FontSize() > maxSize - 0.01);
+            double op = current ? 1.0 : kPipEmojiDim;
+            if (label.Opacity() != op) label.Opacity(op);
+        }
+        // The canvas is as wide as Dia's dots (its parent centers it) and clipped to that: widen both.
+        if (!std::isfinite(canvas.Width()) || std::abs(canvas.Width() - x) > 0.01) canvas.Width(x);
+        st.ourCanvasWidth = x;
+        if (height <= 0) height = canvas.ActualHeight();
+        if (canvas.Clip() || st.ourClip) {
+            if (!st.ourClip) st.ourClip = muxm::RectangleGeometry();
+            auto r = st.ourClip.Rect();
+            if (std::abs(r.Width - x) > 0.01 || std::abs(r.Height - height) > 0.01) st.ourClip.Rect({0, 0, (float)x, (float)height});
+            if (canvas.Clip() != st.ourClip) canvas.Clip(st.ourClip);
+        }
+    } catch (...) {
+    }
+    st.busy = false;
+}
+
+static void UpdateSwitcherEmoji(bool on, const ProfileEmojiSet& set) {
+    std::vector<DiaProfile> seen;
+    std::set<InstanceHandle> live;
+    for (auto h : FindNodes(L"SpaceSwitcherHost")) {
+        auto host = Obj<mux::FrameworkElement>(h);
+        if (!host) continue;
+        auto canvas = FindVisual(host, [](mux::DependencyObject const& d) { return d.try_as<muxc::Canvas>() != nullptr; }).try_as<muxc::Canvas>();
+        if (!canvas) continue;
+        auto it = t_switcherEmoji.find(h);
+        // The dots left to right, by Dia's own positions (ours are moved).
+        struct Dot {
+            muxc::Button b;
+            double left;
+            std::wstring name;
+        };
+        std::vector<Dot> dots;
+        for (auto const& c : canvas.Children())
+            if (auto b = c.try_as<muxc::Button>()) {
+                double left = muxc::Canvas::GetLeft(b);
+                if (it != t_switcherEmoji.end())
+                    if (auto pi = it->second.pips.find(ObjectId(b)); pi != it->second.pips.end() && pi->second.button.get())
+                        left = pi->second.diaLeft;
+                dots.push_back({b, left, std::wstring(winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(b))});
+            }
+        std::stable_sort(dots.begin(), dots.end(), [](auto& a, auto& b) { return a.left < b.left; });
+        std::vector<std::wstring> names;
+        for (auto& d : dots) names.push_back(d.name);
+        auto profiles = ResolveProfiles(names);
+        // Just renamed: Dia shows the new name before its Local State has it. Same dot, same profile.
+        if (it != t_switcherEmoji.end())
+            for (size_t i = 0; i < dots.size(); i++)
+                if (profiles[i].dir.empty())
+                    if (auto pi = it->second.pips.find(ObjectId(dots[i].b)); pi != it->second.pips.end()) profiles[i].dir = pi->second.dir;
+        for (auto& p : profiles)
+            if (!p.dir.empty() && !p.name.empty()) t_profileDirByName[p.name] = p.dir;
+        if (seen.empty()) seen = profiles;
+
+        std::vector<std::wstring> emojis;
+        bool any = false;
+        for (auto& p : profiles) {
+            emojis.push_back(on ? ProfileEmojiFor(set, p) : std::wstring());
+            any = any || !emojis.back().empty();
+        }
+        if (!any) {
+            if (it != t_switcherEmoji.end()) ForgetSwitcher(it->second), t_switcherEmoji.erase(it);
+            continue;
+        }
+        live.insert(h);
+        auto& st = t_switcherEmoji[h];
+        if (st.canvas.get() != canvas) {
+            ForgetSwitcher(st);
+            st.canvas = winrt::make_weak(canvas);
+            st.diaCanvasWidth = LocalValue(canvas, mux::FrameworkElement::WidthProperty());
+            st.diaClip = LocalValue(canvas, mux::UIElement::ClipProperty());
+            st.canvasWidthToken = canvas.RegisterPropertyChangedCallback(mux::FrameworkElement::WidthProperty(), [h](mux::DependencyObject const& o, auto&&) {
+                auto it = t_switcherEmoji.find(h);
+                if (it == t_switcherEmoji.end() || it->second.busy) return;
+                it->second.diaCanvasWidth = LocalValue(o, mux::FrameworkElement::WidthProperty());
+                LayoutSwitcherEmoji(it->second);
+            });
+            st.clipToken = canvas.RegisterPropertyChangedCallback(mux::UIElement::ClipProperty(), [h](mux::DependencyObject const& o, auto&&) {
+                auto it = t_switcherEmoji.find(h);
+                if (it == t_switcherEmoji.end() || it->second.busy) return;
+                it->second.diaClip = LocalValue(o, mux::UIElement::ClipProperty());
+                LayoutSwitcherEmoji(it->second);
+            });
+        }
+        std::set<void*> present;
+        for (size_t i = 0; i < dots.size(); i++) {
+            void* k = ObjectId(dots[i].b);
+            present.insert(k);
+            auto& p = st.pips[k];
+            if (!p.button.get()) AdoptPip(h, p, dots[i].b);
+            p.emoji = emojis[i];
+            if (!profiles[i].dir.empty()) p.dir = profiles[i].dir;
+        }
+        st.busy = true;  // dots Dia dropped (a profile removed)
+        for (auto pi = st.pips.begin(); pi != st.pips.end();)
+            if (!present.count(pi->first)) ForgetPip(pi->second), pi = st.pips.erase(pi);
+            else ++pi;
+        st.busy = false;
+        LayoutSwitcherEmoji(st);
+    }
+    for (auto it = t_switcherEmoji.begin(); it != t_switcherEmoji.end();)
+        if (!live.count(it->first)) ForgetSwitcher(it->second), it = t_switcherEmoji.erase(it);
+        else ++it;
+    if (!seen.empty()) {
+        std::lock_guard<std::mutex> lock(g_profilesLock);
+        g_switcherOrder = seen;
+    }
+}
+
+// The current profile's name, as Dia shows it at the top of the sidebar (only with more than one profile).
+static muxc::TextBlock ProfileTitle(const mux::FrameworkElement& host) {
+    auto title = FindVisual(host, [](mux::DependencyObject const& d) {
+        auto fe = d.try_as<mux::FrameworkElement>();
+        return fe && fe.Name() == L"TitleTextPresenter";
+    });
+    if (!title) return nullptr;
+    return FindVisual(title, [](mux::DependencyObject const& d) { return d.try_as<muxc::TextBlock>() != nullptr; }).try_as<muxc::TextBlock>();
+}
+
+static thread_local std::vector<winrt::weak_ref<muxc::TextBlock>> t_emoji;
+// Dia's profile titles we listen to, so the emoji at the top changes with the profile, not a tick later.
+static thread_local std::vector<std::pair<winrt::weak_ref<muxc::TextBlock>, int64_t>> t_titleWatch;
+
+static void RemoveHeaderEmoji(const muxc::TextBlock& tb) {
+    if (auto parent = muxm::VisualTreeHelper::GetParent(tb).try_as<muxc::Panel>()) {
+        uint32_t i;
+        if (parent.Children().IndexOf(tb, i)) parent.Children().RemoveAt(i);
+    }
+}
+
+static void UpdateHeaderEmoji(bool on, const ProfileEmojiSet& set);
+
+static void UnwatchTitles() {
+    for (auto& [w, token] : t_titleWatch)
+        if (auto tb = w.get()) tb.UnregisterPropertyChangedCallback(muxc::TextBlock::TextProperty(), token);
+    t_titleWatch.clear();
+}
+
+static void UpdateHeaderEmoji(bool on, const ProfileEmojiSet& set) {
+    if (!on || (set.fallback.empty() && set.byKey.empty())) {
+        for (auto& w : t_emoji)
+            if (auto tb = w.get()) RemoveHeaderEmoji(tb);
         t_emoji.clear();
+        UnwatchTitles();
         return;
     }
+    t_titleWatch.erase(std::remove_if(t_titleWatch.begin(), t_titleWatch.end(), [](auto& e) { return !e.first.get(); }), t_titleWatch.end());
     for (auto h : FindNodes(L"HeaderContentHost")) {
         auto host = Obj<mux::FrameworkElement>(h);
         auto header = host ? muxm::VisualTreeHelper::GetParent(host).try_as<muxc::Grid>() : nullptr;
         if (!header) continue;
+        DiaProfile current;
+        if (auto title = ProfileTitle(host)) {
+            current = ResolveProfiles({TrimSpaces(std::wstring(title.Text()))})[0];
+            if (current.dir.empty())
+                if (auto d = t_profileDirByName.find(current.name); d != t_profileDirByName.end()) current.dir = d->second;
+            if (std::none_of(t_titleWatch.begin(), t_titleWatch.end(), [&](auto& e) { return e.first.get() == title; })) {
+                auto token = title.RegisterPropertyChangedCallback(muxc::TextBlock::TextProperty(), [](auto&&, auto&&) {
+                    try {
+                        UpdateHeaderEmoji(Engine_TweakOn(L"profileEmoji"), ParseProfileEmojis(Engine_TweakValue(L"profileEmoji")));
+                    } catch (...) {
+                    }
+                });
+                t_titleWatch.push_back({winrt::make_weak(title), token});
+            }
+        }
+        if (current.name.empty()) {  // one profile: Dia shows no name
+            auto known = DiaProfiles();
+            if (known.size() == 1) current = known[0];
+        }
+        std::wstring emoji = ProfileEmojiFor(set, current);
+        if (emoji.empty()) emoji = set.fallback;
         muxc::TextBlock tb{nullptr};
         for (auto const& c : header.Children())
             if (auto fe = c.try_as<muxc::TextBlock>(); fe && fe.Name() == L"diatweaksProfileEmoji") tb = fe;
+        if (emoji.empty()) {
+            if (tb) RemoveHeaderEmoji(tb);
+            continue;
+        }
         if (!tb) {
             tb = muxc::TextBlock();
             tb.Name(L"diatweaksProfileEmoji");
@@ -2082,6 +2660,777 @@ static void UpdateProfileEmoji() {
         }
         if (tb.Text() != emoji) tb.Text(emoji);
     }
+}
+
+// Entries written with a profile's name are moved to its folder once it is known, so renaming the
+// profile later keeps its emoji. Entries for a profile folder Dia no longer has (the profile was deleted)
+// are dropped.
+static bool IsProfileFolderName(const std::wstring& k) {
+    if (_wcsicmp(k.c_str(), L"Default") == 0) return true;
+    if (_wcsnicmp(k.c_str(), L"Profile ", 8) != 0 || k.size() == 8) return false;
+    return std::all_of(k.begin() + 8, k.end(), [](wchar_t c) { return iswdigit(c) != 0; });
+}
+
+static void KeyProfileEmojisByFolder() {
+    auto set = ParseProfileEmojis(Engine_TweakValue(L"profileEmoji"));
+    auto known = DiaProfiles();
+    bool changed = false;
+    if (!known.empty()) {
+        size_t before = set.byKey.size();
+        set.byKey.erase(std::remove_if(set.byKey.begin(), set.byKey.end(), [&](auto& e) {
+                            return IsProfileFolderName(e.first) &&
+                                   std::none_of(known.begin(), known.end(), [&](auto& p) { return SameText(p.dir, e.first); }) &&
+                                   std::none_of(known.begin(), known.end(), [&](auto& p) { return SameText(p.name, e.first); });
+                        }),
+                        set.byKey.end());
+        changed = set.byKey.size() != before;
+    }
+    for (auto& [k, e] : set.byKey) {
+        if (std::any_of(known.begin(), known.end(), [&](auto& p) { return SameText(p.dir, k); })) continue;
+        auto p = std::find_if(known.begin(), known.end(), [&](auto& p) { return SameText(p.name, k); });
+        if (p == known.end() || std::any_of(set.byKey.begin(), set.byKey.end(), [&](auto& o) { return SameText(o.first, p->dir); })) continue;
+        k = p->dir;
+        changed = true;
+    }
+    if (!changed) return;
+    std::wstring v = FormatProfileEmojis(set);
+    Log("profile emoji: entries keyed by folder, deleted profiles dropped (%s)", N(v).c_str());
+    Engine_SetTweak(L"profileEmoji", Engine_TweakOn(L"profileEmoji"), &v);
+}
+
+static void UpdateProfileSettingsEmoji(bool on);
+static void HookProfileMenus();
+static void ApplyPendingNewProfileEmoji();
+
+static void UpdateProfileEmoji() {
+    bool on = Engine_TweakOn(L"profileEmoji");
+    auto set = ParseProfileEmojis(Engine_TweakValue(L"profileEmoji"));
+    if (on) ApplyPendingNewProfileEmoji();
+    if (on && !set.byKey.empty()) KeyProfileEmojisByFolder();  // (also drops deleted profiles' entries)
+    UpdateSwitcherEmoji(on, set);
+    UpdateHeaderEmoji(on, set);
+    UpdateProfileSettingsEmoji(on);
+    if (on) HookProfileMenus();
+}
+
+// Choosing a profile's emoji where Dia sets its color: an Emoji row under Color in Settings > Profiles,
+// and an emoji button after the colors in the profile menu (right-click a profile's dot). Both open the
+// same picker: common emoji, a box for any other (it opens the Windows emoji panel, Win+.), and Remove.
+static const wchar_t* const kPickerEmoji[] = {
+    L"🏠", L"💼", L"🎓", L"🎮", L"🎨", L"🎵", L"📚", L"💻",
+    L"🧪", L"🛒", L"✈️", L"🌍", L"❤️", L"⭐", L"🔥", L"🌙",
+    L"☀️", L"🌿", L"🐱", L"🐶", L"🍕", L"☕", L"⚽", L"🎬",
+    L"📷", L"🔒", L"💰", L"🧘", L"🚀", L"💡", L"🎯", L"🏝️",
+};
+
+static void SetProfileEmoji(const DiaProfile& profile, const std::wstring& emoji) {
+    auto cur = ParseProfileEmojis(Engine_TweakValue(L"profileEmoji"));
+    auto& by = cur.byKey;
+    by.erase(std::remove_if(by.begin(), by.end(), [&](auto& e) { return SameText(e.first, profile.dir) || SameText(e.first, profile.name); }), by.end());
+    std::wstring v = TrimSpaces(emoji);
+    v.erase(std::remove_if(v.begin(), v.end(), [](wchar_t c) { return c == L',' || c == L'='; }), v.end());
+    if (!v.empty()) by.push_back({profile.dir.empty() ? profile.name : profile.dir, v});
+    std::wstring out = FormatProfileEmojis(cur);
+    Log("profile emoji: %s -> %s", N(profile.name).c_str(), N(v).c_str());
+    Engine_SetTweak(L"profileEmoji", true, &out);
+    UpdateProfileEmoji();
+}
+
+// Win+. : the Windows emoji panel, for the text box that has focus.
+static void OpenEmojiPanel() {
+    INPUT in[4] = {};
+    for (auto& i : in) i.type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_LWIN;
+    in[1].ki.wVk = VK_OEM_PERIOD;
+    in[2].ki.wVk = VK_OEM_PERIOD, in[2].ki.dwFlags = KEYEVENTF_KEYUP;
+    in[3].ki.wVk = VK_LWIN, in[3].ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(4, in, sizeof(INPUT));
+}
+
+static muxc::TextBlock EmojiText(const std::wstring& emoji, double size) {
+    muxc::TextBlock t;
+    t.Text(emoji);
+    t.FontFamily(muxm::FontFamily(L"Segoe UI Emoji"));
+    t.FontSize(size);
+    t.Foreground(muxm::SolidColorBrush(Rgba(255, 255, 255)));
+    t.HorizontalAlignment(mux::HorizontalAlignment::Center);
+    t.VerticalAlignment(mux::VerticalAlignment::Center);
+    t.TextAlignment(mux::TextAlignment::Center);
+    t.IsHitTestVisible(false);
+    return t;
+}
+
+// The picker by an element: onPick gets the emoji chosen ("" for Remove).
+static void ShowEmojiPicker(const mux::FrameworkElement& anchor, const std::wstring& heading, const std::wstring& current,
+                            std::function<void(const std::wstring&)> onPick) {
+    muxc::Flyout flyout;
+    auto weakFlyout = winrt::make_weak(flyout);
+    auto pick = [weakFlyout, onPick](const std::wstring& emoji) {
+        std::wstring v = TrimSpaces(emoji);
+        v.erase(std::remove_if(v.begin(), v.end(), [](wchar_t c) { return c == L',' || c == L'='; }), v.end());
+        onPick(v);
+        if (auto f = weakFlyout.get()) f.Hide();
+    };
+    muxc::StackPanel root;
+    root.Spacing(8);
+    muxc::TextBlock title;
+    title.Text(heading);
+    title.FontSize(12);
+    title.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
+    root.Children().Append(title);
+
+    const int cols = 8;
+    muxc::Grid grid;
+    grid.ColumnSpacing(2);
+    grid.RowSpacing(2);
+    for (int c = 0; c < cols; c++) {
+        muxc::ColumnDefinition cd;
+        cd.Width(mux::GridLengthHelper::Auto());
+        grid.ColumnDefinitions().Append(cd);
+    }
+    int n = (int)(sizeof(kPickerEmoji) / sizeof(kPickerEmoji[0]));
+    for (int r = 0; r < (n + cols - 1) / cols; r++) {
+        muxc::RowDefinition rd;
+        rd.Height(mux::GridLengthHelper::Auto());
+        grid.RowDefinitions().Append(rd);
+    }
+    for (int i = 0; i < n; i++) {
+        std::wstring e = kPickerEmoji[i];
+        muxc::Button b;
+        b.Content(EmojiText(e, 18));
+        b.Width(36);
+        b.Height(36);
+        b.Padding({0, 0, 0, 0});
+        b.BorderThickness({0, 0, 0, 0});
+        b.Background(muxm::SolidColorBrush(e == current ? Rgba(255, 255, 255, 0x30) : Rgba(0, 0, 0, 0)));
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, e);
+        b.Click([pick, e](auto&&, auto&&) { pick(e); });
+        muxc::Grid::SetColumn(b, i % cols);
+        muxc::Grid::SetRow(b, i / cols);
+        grid.Children().Append(b);
+    }
+    root.Children().Append(grid);
+
+    muxc::Grid bottom;
+    bottom.ColumnSpacing(8);
+    muxc::ColumnDefinition b0, b1;
+    b0.Width({1, mux::GridUnitType::Star});
+    b1.Width(mux::GridLengthHelper::Auto());
+    bottom.ColumnDefinitions().Append(b0);
+    bottom.ColumnDefinitions().Append(b1);
+    muxc::TextBox other;
+    other.PlaceholderText(L"Any emoji (Win + .)");
+    other.FontFamily(muxm::FontFamily(L"Segoe UI Emoji, Segoe UI"));
+    other.MaxLength(16);
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(other, L"Any emoji");
+    // Like upstream (which opens the character palette): clicking the box opens the emoji panel.
+    other.AddHandler(mux::UIElement::PointerPressedEvent(), winrt::box_value(mux::Input::PointerEventHandler([](auto&&, auto&&) {
+                         if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
+                             q.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [] { OpenEmojiPanel(); });
+                     })),
+                     true);
+    other.TextChanged([pick](wf::IInspectable const& s, auto&&) {
+        std::wstring v = TrimSpaces(std::wstring(s.as<muxc::TextBox>().Text()));
+        if (!v.empty()) pick(v);
+    });
+    bottom.Children().Append(other);
+    muxc::Button remove;
+    remove.Content(winrt::box_value(L"Remove"));
+    remove.IsEnabled(!current.empty());
+    remove.Click([pick](auto&&, auto&&) { pick(L""); });
+    muxc::Grid::SetColumn(remove, 1);
+    bottom.Children().Append(remove);
+    root.Children().Append(bottom);
+
+    flyout.Content(root);
+    muxc::Primitives::FlyoutShowOptions opts;
+    opts.Placement(muxc::Primitives::FlyoutPlacementMode::Auto);
+    flyout.ShowAt(anchor, opts);
+}
+
+static void ShowEmojiPicker(const mux::FrameworkElement& anchor, const DiaProfile& profile) {
+    std::wstring current = ProfileEmojiFor(ParseProfileEmojis(Engine_TweakValue(L"profileEmoji")), profile);
+    Log("profile emoji: picker for %s", N(profile.name).c_str());
+    ShowEmojiPicker(anchor, L"Emoji for " + profile.name, current, [profile](const std::wstring& e) { SetProfileEmoji(profile, e); });
+}
+
+// --- Settings > Profiles: an Emoji row under Color, in the selected profile's card.
+// Which profile the card shows: Dia's page title says ("Profiles > Work"). (The list's own selection
+// isn't used by Dia: its SelectedIndex stays -1.)
+static muxc::TextBlock PaneTitle(const mux::FrameworkElement& inPane) {
+    for (auto h : FindNodes(L"PaneTitleText"))
+        if (auto t = Obj<muxc::TextBlock>(h); t && t.XamlRoot() == inPane.XamlRoot()) return t;
+    return nullptr;
+}
+
+static std::wstring TextIn(const mux::DependencyObject& root);
+
+static DiaProfile SelectedSettingsProfile(const mux::FrameworkElement& inPane) {
+    DiaProfile none;
+    auto title = PaneTitle(inPane);
+    if (!title) return none;
+    std::wstring t(title.Text());
+    size_t sep = t.find(L" > ");
+    if (sep == std::wstring::npos) return none;
+    std::wstring name = TrimSpaces(t.substr(sep + 3));
+    if (name.empty()) return none;
+    auto known = DiaProfiles();
+    DiaProfile p = ResolveProfiles({name})[0];
+    if (p.dir.empty())
+        if (auto d = t_profileDirByName.find(name); d != t_profileDirByName.end()) p.dir = d->second;
+    // Just renamed (Local State not written yet): the list shows the profiles in Dia's order.
+    if (p.dir.empty())
+        for (auto h : FindNodes(L"ProfilesList"))
+            if (auto lv = Obj<muxc::ListViewBase>(h); lv && lv.XamlRoot() == inPane.XamlRoot()) {
+                int n = (int)lv.Items().Size();
+                for (int i = 0; i < n && n == (int)known.size(); i++)
+                    if (auto item = lv.ContainerFromIndex(i).try_as<mux::DependencyObject>(); item && TextIn(item).find(name) != std::wstring::npos)
+                        p.dir = known[i].dir;
+            }
+    return p;
+}
+
+static thread_local std::vector<winrt::weak_ref<mux::DependencyObject>> t_profileListsHooked;  // (page titles watched)
+
+static void RefreshEmojiRowButton(const muxc::Button& b) {
+    auto p = SelectedSettingsProfile(b);
+    std::wstring emoji = ProfileEmojiFor(ParseProfileEmojis(Engine_TweakValue(L"profileEmoji")), p);
+    std::wstring tag = p.dir + L"\x1f" + p.name + L"\x1f" + emoji;
+    if (b.Content() && std::wstring(unbox_value_or<winrt::hstring>(b.Tag(), L"")) == tag) return;  // (unchanged)
+    muxc::StackPanel content;
+    content.Orientation(muxc::Orientation::Horizontal);
+    content.Spacing(8);
+    if (!emoji.empty()) content.Children().Append(EmojiText(emoji, 16));
+    else {
+        muxc::FontIcon icon;
+        icon.Glyph(L"\xE76E");  // (emoji)
+        icon.FontSize(14);
+        content.Children().Append(icon);
+    }
+    muxc::TextBlock t;
+    t.Text(emoji.empty() ? L"Choose" : L"Change");
+    t.VerticalAlignment(mux::VerticalAlignment::Center);
+    content.Children().Append(t);
+    b.Content(content);
+    b.Tag(winrt::box_value(tag));
+}
+
+static void RefreshSettingsEmojiRows() {
+    for (auto h : FindNodes(L"diatweaksProfileEmojiButton"))
+        if (auto b = Obj<muxc::Button>(h)) RefreshEmojiRowButton(b);
+}
+
+static void UpdateProfileSettingsEmoji(bool on) {
+    for (auto h : FindNodes(L"ColorSwatchStack")) {
+        auto swatches = Obj<mux::FrameworkElement>(h);
+        auto colorRow = swatches ? muxm::VisualTreeHelper::GetParent(swatches).try_as<muxc::Grid>() : nullptr;
+        auto card = colorRow ? muxm::VisualTreeHelper::GetParent(colorRow).try_as<muxc::StackPanel>() : nullptr;
+        if (!card) continue;
+        mux::FrameworkElement line{nullptr}, row{nullptr};
+        for (auto const& c : card.Children())
+            if (auto fe = c.try_as<mux::FrameworkElement>()) {
+                if (fe.Name() == L"diatweaksProfileEmojiLine") line = fe;
+                if (fe.Name() == L"diatweaksProfileEmojiRow") row = fe;
+            }
+        if (!on) {
+            for (auto el : {line, row})
+                if (el) {
+                    uint32_t i;
+                    if (card.Children().IndexOf(el, i)) card.Children().RemoveAt(i);
+                }
+            continue;
+        }
+        if (!row) {
+            uint32_t at = 0;
+            if (!card.Children().IndexOf(colorRow, at)) continue;
+            // Built like Dia's own Color row (and the line between rows), with its sizes and colors.
+            muxc::Border dl{nullptr};
+            for (auto const& c : card.Children())
+                if (auto b = c.try_as<muxc::Border>()) dl = b;
+            muxc::Border ln;
+            ln.Name(L"diatweaksProfileEmojiLine");
+            if (dl) {
+                ln.Height(dl.Height());
+                ln.Background(dl.Background());
+                ln.Margin(dl.Margin());
+                ln.BorderBrush(dl.BorderBrush());
+                ln.BorderThickness(dl.BorderThickness());
+            } else {
+                ln.Height(1);
+                ln.Background(BrushRes(L"CardStrokeColorDefaultBrush", Rgba(255, 255, 255, 0x18)));
+            }
+            muxc::Grid g;
+            g.Name(L"diatweaksProfileEmojiRow");
+            for (auto const& cd : colorRow.ColumnDefinitions()) {
+                muxc::ColumnDefinition c;
+                c.Width(cd.Width());
+                g.ColumnDefinitions().Append(c);
+            }
+            g.Padding(colorRow.Padding());
+            g.Margin(colorRow.Margin());
+            g.MinHeight(colorRow.MinHeight());
+            g.ColumnSpacing(colorRow.ColumnSpacing());
+            muxc::TextBlock label;
+            label.Text(L"Emoji");
+            for (auto const& c : colorRow.Children())
+                if (auto t = c.try_as<muxc::TextBlock>()) {
+                    if (t.Style()) label.Style(t.Style());
+                    label.FontSize(t.FontSize());
+                    label.FontWeight(t.FontWeight());
+                    label.Foreground(t.Foreground());
+                    label.Margin(t.Margin());
+                    label.VerticalAlignment(t.VerticalAlignment());
+                    muxc::Grid::SetColumn(label, muxc::Grid::GetColumn(t));
+                    break;
+                }
+            g.Children().Append(label);
+            muxc::Button b;
+            b.Name(L"diatweaksProfileEmojiButton");
+            b.HorizontalAlignment(swatches.HorizontalAlignment());
+            b.VerticalAlignment(mux::VerticalAlignment::Center);
+            b.Margin(swatches.Margin());
+            winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, L"Profile emoji");
+            b.Click([](wf::IInspectable const& s, auto&&) {
+                auto btn = s.as<muxc::Button>();
+                DiaProfile p = SelectedSettingsProfile(btn);
+                if (p.dir.empty() && p.name.empty()) {
+                    Log("profile emoji: Settings > Profiles shows no profile we know");
+                    return;
+                }
+                ShowEmojiPicker(btn, p);
+            });
+            muxc::Grid::SetColumn(b, muxc::Grid::GetColumn(swatches));
+            g.Children().Append(b);
+            card.Children().InsertAt(at + 1, ln);
+            card.Children().InsertAt(at + 2, g);
+            row = g;
+            Log("profile emoji: Emoji row added to Settings > Profiles");
+        }
+        // Show the profile's emoji as soon as another profile is picked (the page title changes).
+        if (auto title = PaneTitle(card)) {
+            mux::DependencyObject key = title;
+            bool hooked = std::any_of(t_profileListsHooked.begin(), t_profileListsHooked.end(), [&](auto& w) { return w.get() == key; });
+            if (!hooked) {
+                title.RegisterPropertyChangedCallback(muxc::TextBlock::TextProperty(), [](auto&&, auto&&) {
+                    try {
+                        RefreshSettingsEmojiRows();
+                    } catch (...) {
+                    }
+                });
+                t_profileListsHooked.push_back(winrt::make_weak(key));
+            }
+        }
+        if (auto b = FindVisual(row, [](mux::DependencyObject const& d) {
+                         auto fe = d.try_as<mux::FrameworkElement>();
+                         return fe && fe.Name() == L"diatweaksProfileEmojiButton";
+                     }).try_as<muxc::Button>())
+            RefreshEmojiRowButton(b);
+    }
+}
+
+// --- The profile menu (right-click a profile's dot): an emoji button after the colors.
+static thread_local DiaProfile t_menuProfile;
+static thread_local winrt::weak_ref<mux::FrameworkElement> t_menuAnchor;
+static thread_local ULONGLONG t_menuAt = 0;
+static thread_local std::vector<winrt::weak_ref<mux::UIElement>> t_menuHooked;
+static thread_local bool t_menuPending = false;
+static thread_local winrt::event_token t_menuToken{};
+
+static bool InjectMenuEmoji();
+
+static void ScheduleMenuEmoji() {
+    if (t_menuPending || !Engine_TweakOn(L"profileEmoji") || GetTickCount64() - t_menuAt > 3000) return;
+    t_menuPending = true;
+    static thread_local int frames = 0;
+    frames = 0;
+    // Before the menu's first frame (and a few more, while Dia fills it in).
+    t_menuToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        bool done = false;
+        try {
+            done = InjectMenuEmoji();
+        } catch (...) {
+            done = true;
+        }
+        if (done || ++frames > 30) {
+            muxm::CompositionTarget::Rendering(t_menuToken);
+            t_menuPending = false;
+        }
+    });
+}
+
+static void HookMenuSource(const mux::UIElement& el, std::function<DiaProfile()> who) {
+    if (std::any_of(t_menuHooked.begin(), t_menuHooked.end(), [&](auto& w) { return w.get() == el; })) return;
+    t_menuHooked.erase(std::remove_if(t_menuHooked.begin(), t_menuHooked.end(), [](auto& w) { return !w.get(); }), t_menuHooked.end());
+    auto weakEl = winrt::make_weak(el.try_as<mux::FrameworkElement>());
+    el.AddHandler(mux::UIElement::RightTappedEvent(), winrt::box_value(mux::Input::RightTappedEventHandler([who, weakEl](auto&&, auto&&) {
+                      try {
+                          t_menuProfile = who();
+                          t_menuAnchor = weakEl;
+                          t_menuAt = GetTickCount64();
+                          ScheduleMenuEmoji();
+                      } catch (...) {
+                      }
+                  })),
+                  true);
+    t_menuHooked.push_back(winrt::make_weak(el));
+}
+
+static void HookProfileMenus() {
+    for (auto h : FindNodes(L"SpaceSwitcherHost")) {
+        auto host = Obj<mux::FrameworkElement>(h);
+        auto canvas = host ? FindVisual(host, [](mux::DependencyObject const& d) { return d.try_as<muxc::Canvas>() != nullptr; }).try_as<muxc::Canvas>() : nullptr;
+        if (!canvas) continue;
+        for (auto const& c : canvas.Children())
+            if (auto b = c.try_as<muxc::Button>()) {
+                auto wb = winrt::make_weak(b);
+                HookMenuSource(b, [wb]() -> DiaProfile {
+                    auto b = wb.get();
+                    if (!b) return {};
+                    std::wstring name(winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::GetName(b));
+                    DiaProfile p = ResolveProfiles({name})[0];
+                    for (auto& [h, st] : t_switcherEmoji)  // (just renamed: the dot knows its folder)
+                        if (auto pi = st.pips.find(ObjectId(b)); pi != st.pips.end() && p.dir.empty()) p.dir = pi->second.dir;
+                    if (p.dir.empty())
+                        if (auto d = t_profileDirByName.find(name); d != t_profileDirByName.end()) p.dir = d->second;
+                    return p;
+                });
+            }
+    }
+}
+
+static bool InjectMenuEmoji() {
+    auto anchor = t_menuAnchor.get();
+    if (!anchor || !anchor.XamlRoot()) return true;
+    for (auto const& pop : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(anchor.XamlRoot())) {
+        auto presenter = pop.Child().try_as<muxc::MenuFlyoutPresenter>();
+        if (!presenter) continue;
+        // Dia's color row: a separator whose content is a row of buttons drawn as colored circles.
+        muxc::StackPanel colors{nullptr};
+        FindVisual(presenter, [&](mux::DependencyObject const& d) {
+            auto sp = d.try_as<muxc::StackPanel>();
+            if (!sp || sp.Orientation() != muxc::Orientation::Horizontal || sp.Children().Size() < 3) return false;
+            int circles = 0;
+            for (auto const& c : sp.Children())
+                if (auto b = c.try_as<muxc::Button>())
+                    if (FindVisual(b, [](mux::DependencyObject const& x) { return x.try_as<muxsh::Ellipse>() != nullptr; })) circles++;
+            if (circles < 3) return false;
+            colors = sp;
+            return true;
+        });
+        if (!colors) return false;  // not filled in yet
+        for (auto const& c : colors.Children())
+            if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"diatweaksMenuEmoji") return true;
+        auto like = colors.Children().GetAt(0).try_as<muxc::Button>();
+        DiaProfile profile = t_menuProfile;
+        if (profile.name.empty() && profile.dir.empty()) return true;
+        std::wstring emoji = ProfileEmojiFor(ParseProfileEmojis(Engine_TweakValue(L"profileEmoji")), profile);
+        muxc::Button b;
+        b.Name(L"diatweaksMenuEmoji");
+        if (like) {
+            if (like.Style()) b.Style(like.Style());
+            double w = like.ActualWidth() > 0 ? like.ActualWidth() : like.Width();
+            double hgt = like.ActualHeight() > 0 ? like.ActualHeight() : like.Height();
+            if (std::isfinite(w) && w > 0) b.Width(w);
+            if (std::isfinite(hgt) && hgt > 0) b.Height(hgt);
+            b.Padding(like.Padding());
+            b.Margin(like.Margin());
+            b.Background(like.Background());
+            b.BorderThickness(like.BorderThickness());
+            b.CornerRadius(like.CornerRadius());
+        }
+        if (!emoji.empty()) b.Content(EmojiText(emoji, 15));
+        else {
+            muxc::FontIcon icon;
+            icon.Glyph(L"\xE76E");  // (emoji)
+            icon.FontSize(15);
+            b.Content(icon);
+        }
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, L"Emoji");
+        muxc::ToolTipService::SetToolTip(b, winrt::box_value(emoji.empty() ? L"Choose an emoji" : L"Change emoji"));
+        auto weakPop = winrt::make_weak(pop);
+        auto weakAnchor = t_menuAnchor;
+        b.Click([weakPop, weakAnchor, profile](auto&&, auto&&) {
+            // The menu closes, then the picker opens by the dot. Opened while the menu is still closing,
+            // the picker is dismissed with it: wait until it has closed (and focus has gone back).
+            auto open = [weakAnchor, profile] {
+                if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
+                    q.TryEnqueue(winrt::Microsoft::UI::Dispatching::DispatcherQueuePriority::Low, [weakAnchor, profile] {
+                        try {
+                            if (auto a = weakAnchor.get()) ShowEmojiPicker(a, profile);
+                        } catch (winrt::hresult_error const& e) {
+                            Log("profile emoji: picker failed 0x%08lx", (unsigned long)e.code());
+                        }
+                    });
+            };
+            auto p = weakPop.get();
+            if (!p || !p.IsOpen()) return open();
+            auto token = std::make_shared<winrt::event_token>();
+            *token = p.Closed([weakPop, token, open](auto&&, auto&&) {
+                if (auto p = weakPop.get()) p.Closed(*token);
+                open();
+            });
+            p.IsOpen(false);
+        });
+        colors.Children().Append(b);
+        return true;
+    }
+    return false;
+}
+
+// --- Create Profile dialog: an Emoji row between Color and "Share data". The profile doesn't exist yet,
+// so the emoji picked is held (Cancel or Esc drops it) until a new profile turns up: in the switcher by
+// its name (straight away), or in Dia's Local State as a new folder (Chromium writes it seconds later).
+// Dia's dialogs are built in code, without element names, so the dialog is found from its countdown
+// part (DialogOTPCountdownRoot, in every dialog) and recognized by its title and its row of colors.
+struct PendingProfileEmoji {
+    std::wstring emoji, name;
+    std::vector<std::wstring> dirsBefore;
+    ULONGLONG until = 0;
+};
+static std::mutex g_pendingEmojiLock;
+static PendingProfileEmoji g_pendingEmoji;
+
+static void ApplyPendingNewProfileEmoji() {
+    PendingProfileEmoji p;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingEmojiLock);
+        if (g_pendingEmoji.emoji.empty()) return;
+        if (GetTickCount64() > g_pendingEmoji.until) {
+            g_pendingEmoji = {};
+            return;
+        }
+        p = g_pendingEmoji;
+    }
+    auto known = DiaProfiles();
+    DiaProfile target;
+    std::vector<DiaProfile> fresh;
+    for (auto& k : known)
+        if (std::find(p.dirsBefore.begin(), p.dirsBefore.end(), k.dir) == p.dirsBefore.end()) fresh.push_back(k);
+    if (!fresh.empty()) {
+        target = fresh[0];
+        for (auto& f : fresh)
+            if (f.name == p.name) target = f;
+    } else if (!p.name.empty() && std::none_of(known.begin(), known.end(), [&](auto& k) { return k.name == p.name; })) {
+        // Not in Local State yet: the switcher may already show it (by name, its folder still unknown).
+        std::lock_guard<std::mutex> lock(g_profilesLock);
+        for (auto& s : g_switcherOrder)
+            if (s.dir.empty() && s.name == p.name) target = s;
+    }
+    if (target.dir.empty() && target.name.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingEmojiLock);
+        g_pendingEmoji = {};
+    }
+    Log("profile emoji: new profile %s gets %s", N(target.name).c_str(), N(p.emoji).c_str());
+    SetProfileEmoji(target, p.emoji);  // (by name for now if its folder isn't known yet: moved to it later)
+}
+
+static void SetChooseButton(const muxc::Button& b, const std::wstring& emoji) {
+    muxc::StackPanel content;
+    content.Orientation(muxc::Orientation::Horizontal);
+    content.Spacing(8);
+    if (!emoji.empty()) content.Children().Append(EmojiText(emoji, 16));
+    else {
+        muxc::FontIcon icon;
+        icon.Glyph(L"\xE76E");  // (emoji)
+        icon.FontSize(14);
+        content.Children().Append(icon);
+    }
+    muxc::TextBlock t;
+    t.Text(emoji.empty() ? L"Choose" : L"Change");
+    t.VerticalAlignment(mux::VerticalAlignment::Center);
+    content.Children().Append(t);
+    b.Content(content);
+}
+
+static std::wstring TextIn(const mux::DependencyObject& root);  // (all the text in an element)
+
+// The dialog's content (the StackPanel with its title, fields and buttons), from any element in it.
+static muxc::StackPanel DialogContent(const mux::DependencyObject& inside) {
+    mux::DependencyObject d = inside;
+    for (int i = 0; d && i < 30; i++) {
+        auto parent = muxm::VisualTreeHelper::GetParent(d);
+        auto cp = parent.try_as<muxc::ContentPresenter>();
+        if (cp && cp.Name() == L"ClientAreaPresenter")
+            if (auto uc = d.try_as<muxc::UserControl>()) return uc.Content().try_as<muxc::StackPanel>();
+        d = parent;
+    }
+    return nullptr;
+}
+
+static bool InjectCreateProfileEmoji() {
+    bool any = false;
+    for (auto h : FindNodes(L"DialogOTPCountdownRoot")) {
+        auto otp = Obj<mux::FrameworkElement>(h);
+        auto root = otp ? DialogContent(otp) : nullptr;
+        if (!root || root.Children().Size() < 3) continue;
+        std::wstring title = TextIn(root.Children().GetAt(0));
+        std::transform(title.begin(), title.end(), title.begin(), ::towlower);
+        if (title.find(L"create") == std::wstring::npos || title.find(L"profile") == std::wstring::npos) continue;
+        // The Color block: a label and a row of (6 or more) color buttons, in a UserControl.
+        muxc::UserControl colorBlock{nullptr};
+        muxc::StackPanel section{nullptr};
+        for (auto const& c : root.Children())
+            if (auto sp = c.try_as<muxc::StackPanel>())
+                for (auto const& cc : sp.Children())
+                    if (auto uc = cc.try_as<muxc::UserControl>()) {
+                        auto inner = uc.Content().try_as<muxc::StackPanel>();
+                        if (!inner) continue;
+                        for (auto const& x : inner.Children())
+                            if (auto row = x.try_as<muxc::StackPanel>(); row && row.Children().Size() >= 6 && row.Children().GetAt(0).try_as<muxc::Button>())
+                                colorBlock = uc, section = sp;
+                    }
+        if (!colorBlock) continue;
+        any = true;
+        bool have = false;
+        for (auto const& c : section.Children())
+            if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"diatweaksCreateEmoji") have = true;
+        if (have) continue;
+
+        auto colorInner = colorBlock.Content().try_as<muxc::StackPanel>();
+        muxc::TextBlock colorLabel{nullptr};
+        for (auto const& x : colorInner.Children())
+            if (auto t = x.try_as<muxc::TextBlock>()) colorLabel = t;
+        muxc::TextBox nameBox = FindVisual(root, [](mux::DependencyObject const& d) { return d.try_as<muxc::TextBox>() != nullptr; }).try_as<muxc::TextBox>();
+
+        // Shared by the handlers below: what was picked, the name typed, the profiles before.
+        // The emoji is held from the moment it's picked (the dialog's window closes without telling its
+        // content, so "on close" can't be relied on): Cancel or Esc drops it, a new profile takes it.
+        struct State {
+            std::wstring emoji, name;
+            std::vector<std::wstring> dirsBefore;
+            bool cancelHooked = false;
+        };
+        auto state = std::make_shared<State>();
+        for (auto& k : DiaProfiles()) state->dirsBefore.push_back(k.dir);
+        auto hold = [](const std::shared_ptr<State>& st) {
+            std::lock_guard<std::mutex> lock(g_pendingEmojiLock);
+            if (st->emoji.empty()) g_pendingEmoji = {};
+            else g_pendingEmoji = {st->emoji, st->name, st->dirsBefore, GetTickCount64() + 5 * 60 * 1000};
+        };
+        auto drop = [](const std::shared_ptr<State>& st) {
+            std::lock_guard<std::mutex> lock(g_pendingEmojiLock);
+            if (!st->emoji.empty() && g_pendingEmoji.emoji == st->emoji && g_pendingEmoji.dirsBefore == st->dirsBefore) {
+                g_pendingEmoji = {};
+                Log("profile emoji: Create Profile cancelled");
+            }
+        };
+        if (nameBox) {
+            state->name = TrimSpaces(std::wstring(nameBox.Text()));
+            nameBox.TextChanged([state, hold](wf::IInspectable const& s, auto&&) {
+                state->name = TrimSpaces(std::wstring(s.as<muxc::TextBox>().Text()));
+                if (!state->emoji.empty()) hold(state);
+            });
+        }
+        root.AddHandler(mux::UIElement::KeyDownEvent(), winrt::box_value(mux::Input::KeyEventHandler([state, drop](auto&&, mux::Input::KeyRoutedEventArgs const& e) {
+                            if (e.Key() == winrt::Windows::System::VirtualKey::Escape) drop(state);
+                        })),
+                        true);
+        auto weakRoot = winrt::make_weak(root);
+        // Dia's Cancel button (the one whose text says so), looked up when an emoji is picked: by then the
+        // dialog is complete.
+        auto hookCancel = [state, drop, weakRoot]() {
+            auto root = weakRoot.get();
+            if (!root || state->cancelHooked) return;
+            for (auto const& c : root.Children())
+                if (c.try_as<muxc::Grid>())
+                    FindVisual(c, [&](mux::DependencyObject const& d) {
+                        auto b = d.try_as<muxc::Button>();
+                        if (!b) return false;
+                        std::wstring t = TextIn(b);
+                        std::transform(t.begin(), t.end(), t.begin(), ::towlower);
+                        if (t.find(L"cancel") != std::wstring::npos) {
+                            b.Click([state, drop](auto&&, auto&&) { drop(state); });
+                            state->cancelHooked = true;
+                        }
+                        return false;
+                    });
+        };
+
+        muxc::StackPanel block;
+        block.Name(L"diatweaksCreateEmoji");
+        block.Orientation(colorInner.Orientation());
+        block.Spacing(colorInner.Spacing());
+        block.Margin(colorBlock.Margin());
+        block.Padding(colorInner.Padding());
+        muxc::TextBlock label;
+        label.Text(L"Emoji");
+        if (colorLabel) {
+            if (colorLabel.Style()) label.Style(colorLabel.Style());
+            label.FontSize(colorLabel.FontSize());
+            label.FontWeight(colorLabel.FontWeight());
+            label.Foreground(colorLabel.Foreground());
+            label.Margin(colorLabel.Margin());
+        }
+        block.Children().Append(label);
+        muxc::Button choose;
+        choose.HorizontalAlignment(mux::HorizontalAlignment::Left);
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(choose, L"Profile emoji");
+        SetChooseButton(choose, L"");
+        auto weakChoose = winrt::make_weak(choose);
+        choose.Click([state, weakChoose, hold, hookCancel](auto&&, auto&&) {
+            auto b = weakChoose.get();
+            if (!b) return;
+            ShowEmojiPicker(b, L"Emoji for the new profile", state->emoji, [state, weakChoose, hold, hookCancel](const std::wstring& e) {
+                state->emoji = e;
+                if (auto b = weakChoose.get()) SetChooseButton(b, e);
+                hookCancel();
+                hold(state);
+                Log("profile emoji: holding %s for the new profile", N(e).c_str());
+            });
+        });
+        block.Children().Append(choose);
+
+        // Dia sized the dialog's window to its content before the row was added: make it that much taller
+        // (half up, half down, so it stays centered), once the row has its height.
+        auto grown = std::make_shared<bool>(false);
+        double spacing = section.Spacing();
+        block.SizeChanged([grown, spacing](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
+            if (*grown || e.NewSize().Height <= 0) return;
+            *grown = true;
+            try {
+                auto xr = s.as<mux::FrameworkElement>().XamlRoot();
+                auto aw = winrt::Microsoft::UI::Windowing::AppWindow::GetFromWindowId(xr.ContentIslandEnvironment().AppWindowId());
+                if (!aw) return;
+                int d = (int)std::lround((e.NewSize().Height + spacing) * xr.RasterizationScale());
+                auto pos = aw.Position();
+                auto size = aw.Size();
+                aw.MoveAndResize({pos.X, pos.Y - d / 2, size.Width, size.Height + d});
+            } catch (winrt::hresult_error const& err) {
+                Log("profile emoji: couldn't resize the dialog (0x%08lx)", (unsigned long)err.code());
+            }
+        });
+
+        uint32_t at = 0;
+        if (!section.Children().IndexOf(colorBlock, at)) continue;
+        section.Children().InsertAt(at + 1, block);
+        Log("profile emoji: Emoji row added to Create Profile");
+    }
+    return any;
+}
+
+static thread_local bool t_createPending = false;
+static thread_local winrt::event_token t_createToken{};
+
+// A dialog was added: look for the Create Profile one before it's drawn (and a few frames more, while
+// Dia fills it in).
+static void ScheduleCreateProfileEmoji() {
+    if (t_createPending || !Engine_TweakOn(L"profileEmoji")) return;
+    t_createPending = true;
+    static thread_local int frames = 0;
+    frames = 0;
+    t_createToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        bool done = false;
+        try {
+            done = InjectCreateProfileEmoji();
+        } catch (...) {
+            done = true;
+        }
+        if (done || ++frames > 20) {
+            muxm::CompositionTarget::Rendering(t_createToken);
+            t_createPending = false;
+        }
+    });
 }
 
 // --- Tidy Tabs, after JaceThings/DiaTweaks' TidyTabs: a row at the top of the tab list with a line and
@@ -2141,6 +3490,9 @@ struct TidyRow {
     winrt::weak_ref<muxc::Button> diaClear;         // (sep) Dia's Clear Tabs button, kept out of sight
     wf::IInspectable diaClearMaxW{nullptr}, diaSepHit{nullptr};  // (sep) Dia's own values, put back on removal
     int64_t sepHitToken = 0;                        // (sep) keeps the divider clickable
+    ULONGLONG hitWindow = 0;                        // (sep) Dia turning hit testing back off: how often...
+    int hitFights = 0;
+    bool hitGaveUp = false;                         // ...and, if it keeps doing so, we stop (no tug of war)
 };
 static thread_local std::vector<std::shared_ptr<TidyRow>> t_tidyRows;
 static thread_local winrt::event_token t_tidyFrame{};
@@ -2335,9 +3687,8 @@ static void Park(const mux::FrameworkElement& el) {
 // While parked they're held at 0, so the page keeps its size.
 static void CapPageEdges() {
     if (!t_tidy.caps.empty()) return;
-    for (auto h : FindNodes(L"ContentHost")) {
-        auto host = Obj<mux::FrameworkElement>(h);
-        if (!host || !host.IsLoaded()) continue;
+    for (auto const& host : PageContentHosts()) {
+        if (!host.IsLoaded()) continue;
         auto card = FirstIn(host, [](const mux::FrameworkElement& fe) {
             auto g = fe.try_as<muxc::Grid>();
             return g && g.RowDefinitions().Size() == 3 && g.ColumnDefinitions().Size() == 3;
@@ -3302,14 +4653,36 @@ static bool TidyAnimate() {
     return more;
 }
 
+// While subscribed to CompositionTarget.Rendering, WinUI draws every frame (UI thread, compositor and GPU
+// process all busy), so the loop must end. It ends by itself once nothing moves; as a safety net it's also
+// cut after a while (the 100 ms tick keeps Tidy's steps going, and the next hover or click restarts it).
 static void EnsureTidyFrames() {
     if (t_tidyAnimating) return;
     t_tidyAnimating = true;
+    static thread_local ULONGLONG since = 0;
+    since = GetTickCount64();
     t_tidyFrame = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
         bool more = false;
         try {
             more = TidyAnimate();
         } catch (...) {
+        }
+        ULONGLONG ran = GetTickCount64() - since;
+        if (more && ran > (TidyBusy() ? 30000u : 8000u) && !t_clear.phase) {
+            static thread_local int logged = 0;
+            if (logged++ < 5)
+                Log("tidy: frame loop ran %llums (busy %d, quiet %d, freeze %d, rows %zu): stopped", ran, (int)t_tidy.step,
+                    (int)Tidy_Quiet(), t_freeze ? 1 : 0, t_tidyRows.size());
+            bool always = TidyOptions().always;
+            for (auto& p : t_tidyRows) {  // (land the rows where they're going)
+                if (p->hideAt) p->hideAt = 0, p->target = TidyWant(*p, always);
+                p->progress = p->target;
+            }
+            try {
+                TidyAnimate();
+            } catch (...) {
+            }
+            more = false;
         }
         if (!more) {
             muxm::CompositionTarget::Rendering(t_tidyFrame);
@@ -3637,11 +5010,22 @@ static std::shared_ptr<TidyRow> BuildTidySep(const muxc::ScrollViewer& sv, const
     rec->row = winrt::make_weak(row);
     rec->diaSepHit = sep.ReadLocalValue(mux::UIElement::IsHitTestVisibleProperty());
     sep.IsHitTestVisible(true);
-    rec->sepHitToken = sep.RegisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(),
-                                                           [](mux::DependencyObject const& o, mux::DependencyProperty const&) {
-                                                               if (auto g = o.try_as<mux::UIElement>(); g && !g.IsHitTestVisible())
-                                                                   g.IsHitTestVisible(true);
-                                                           });
+    std::weak_ptr<TidyRow> weakRec = rec;
+    rec->sepHitToken = sep.RegisterPropertyChangedCallback(
+        mux::UIElement::IsHitTestVisibleProperty(), [weakRec](mux::DependencyObject const& o, mux::DependencyProperty const&) {
+            auto g = o.try_as<mux::UIElement>();
+            auto p = weakRec.lock();
+            if (!g || g.IsHitTestVisible() || !p || p->hitGaveUp) return;
+            // Dia turning it back off again and again: leave it to Dia rather than fight every frame.
+            ULONGLONG now = GetTickCount64();
+            if (now - p->hitWindow > 1000) p->hitWindow = now, p->hitFights = 0;
+            if (++p->hitFights > 10) {
+                p->hitGaveUp = true;
+                Log("tidy: Dia keeps its divider unclickable: left as is");
+                return;
+            }
+            g.IsHitTestVisible(true);
+        });
     StyleButtons(*rec);
     TrackTidyHover(rec, root);
     Log("tidy: buttons put in Dia's divider (%s)", N(rec->look).c_str());
@@ -3746,21 +5130,52 @@ static void PlaceTidyStrip(TidyRow& r) {
     }
 }
 
+// Any tab row at all (as AllTabRows, but stops at the first one).
+static bool AnyTabRow() {
+    for (auto h : FindNodes(L"RowsPanel"))
+        if (auto rows = Obj<mux::FrameworkElement>(h); rows && rows.ActualHeight() > 0)
+            if (FirstIn(rows, [](const mux::FrameworkElement& fe) {
+                    auto uc = fe.try_as<muxc::UserControl>();
+                    auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+                    return g && g.ColumnDefinitions().Size() == 5;
+                }))
+                return true;
+    return false;
+}
+
+// Runs on the 100 ms tick. Looking through the tab list (every tab's elements) is the costly part, so it
+// happens every 5th tick (or right away while Tidy or Clear works, or with no rows yet); the ticks between
+// only check that our rows are still there. Hovers and clicks don't wait for it (they have handlers).
 static void UpdateTidyTabs() {
     CheckFreeze();
     RunTidySteps();
     CheckUnpark();
     bool on = Engine_TweakOn(L"tidyTabs");
+    static thread_local unsigned tick = 0;
+    static thread_local bool wasOn = false;
+    bool full = ++tick % 5 == 0 || TidyBusy() || t_clear.phase || (on && !wasOn);
+    wasOn = on;
+    if (on && !full) {
+        for (auto& p : t_tidyRows) {
+            if (!p->row.get() || !p->root.get()) full = true;
+            if (auto host = p->strip && p->reserved ? p->stripHost.get() : nullptr) {  // (Dia may lay it out again)
+                double w = (p->look.size() - 1) * 24.4 + 6;
+                auto m = host.Margin();
+                if (std::abs(m.Right - (p->diaMargin.Right + w)) > 0.5) host.Margin({m.Left, m.Top, p->diaMargin.Right + w, m.Bottom});
+            }
+        }
+        if (!full) return;
+    }
     auto look = TidyOptions();
     for (auto it = t_tidyRows.begin(); it != t_tidyRows.end();) {
         auto& r = **it;
         auto host = r.root.get();
         auto sh = r.stripHost.get();
         bool gone = r.strip ? (!sh || !sh.IsLoaded() || sh.ActualWidth() <= 0) : !r.scroll.get();
-        if (r.sep && !gone) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
+        if (r.sep && !gone && on) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
             auto g = r.sepGrid.get();
             gone = !g || DiaPinnedSep(r.scroll.get()) != g;
-            if (g && !gone && !g.IsHitTestVisible()) g.IsHitTestVisible(true);
+            if (g && !gone && !g.IsHitTestVisible() && !r.hitGaveUp) g.IsHitTestVisible(true);
         }
         bool stale = gone || !r.row.get() || !host || (r.look != (r.strip ? StripLook(look) : look.key()) && !TidyBusy());
         if (!on || stale) {
@@ -3770,6 +5185,19 @@ static void UpdateTidyTabs() {
             ++it;
     }
     if (!on) return;
+    // Rows that keep going stale and being rebuilt (Dia relaying out the list under them) would rebuild
+    // every tick: after 8 builds in 10 s, no new ones for 10 s.
+    static thread_local ULONGLONG buildWindow = 0, buildPause = 0;
+    static thread_local int builds = 0;
+    ULONGLONG nowMs = GetTickCount64();
+    if (nowMs - buildWindow > 10000) buildWindow = nowMs, builds = 0;
+    bool canBuild = nowMs >= buildPause;
+    auto built = [&] {
+        if (++builds > 8 && canBuild) {
+            Log("tidy: rows rebuilt %d times in 10 s: pausing", builds);
+            buildPause = nowMs + 10000, canBuild = false;
+        }
+    };
     // Dia's own divider is up asking to confirm Close All Tabs: ours shuts. (The lasting one below pinned
     // tabs takes the buttons instead: see BuildTidySep.)
     bool diaLine = false;
@@ -3782,22 +5210,26 @@ static void UpdateTidyTabs() {
         if (!root || root.Name() != L"RootGrid") continue;
         auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return !p->sep && p->scroll.get() == sv; });
         if (it == t_tidyRows.end()) {
+            if (!canBuild) continue;
             t_tidyRows.push_back(BuildTidyRow(sv, root, look));
             it = std::prev(t_tidyRows.end());
+            built();
         }
         auto& r = **it;
         // Pinned tabs: the buttons are in Dia's divider below them, and our row stays shut.
         auto sep = DiaPinnedSep(sv);
         // Any tabs in the list, loose or in groups (Clear and a new Tidy both apply to grouped tabs too).
-        bool tabs = TabsBelow(sv) > 0 || !AllTabRows().empty();
+        bool tabs = TabsBelow(sv) > 0 || AnyTabRow();
         r.eligible = !diaLine && !sep && tabs;
         double want = TidyWant(r, look.always);
         if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
         if (!sep) continue;
         auto si = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->sep && p->sepGrid.get() == sep; });
         if (si == t_tidyRows.end()) {
+            if (!canBuild) continue;
             t_tidyRows.push_back(BuildTidySep(sv, root, sep, look));
             si = std::prev(t_tidyRows.end());
+            built();
             if (TidyBusy()) ShowWave(*si, true), (*si)->target = 1;
         }
         auto& s = **si;
@@ -3810,10 +5242,12 @@ static void UpdateTidyTabs() {
         if (!host || !host.IsLoaded() || host.ActualWidth() <= 0) continue;
         auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->strip && p->stripHost.get() == host; });
         if (it == t_tidyRows.end()) {
+            if (!canBuild) continue;
             auto rec = BuildTidyStrip(host, look);
             if (!rec) continue;
             t_tidyRows.push_back(rec);
             it = std::prev(t_tidyRows.end());
+            built();
         }
         auto& r = **it;
         PlaceTidyStrip(r);
@@ -5656,6 +7090,15 @@ void Ui_ElementAdded(const std::wstring& name) {
         ScheduleArcAdopt();
     }
     if (name == L"ActionsRow") ScheduleHoverCards();
+    if (name == L"DialogOTPCountdownRoot") ScheduleCreateProfileEmoji();  // (a dialog: maybe Create Profile)
+    if (name == L"ColorSwatchStack" && Engine_TweakOn(L"profileEmoji"))  // Settings > Profiles: the Emoji row with the rest
+        if (auto q = winrt::Microsoft::UI::Dispatching::DispatcherQueue::GetForCurrentThread())
+            q.TryEnqueue([] {
+                try {
+                    UpdateProfileSettingsEmoji(true);
+                } catch (...) {
+                }
+            });
     if (name == L"ToolbarArea" || name == L"SubmitButton") ScheduleCleanSearchBox();
     if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton") ScheduleToolbarLook();
 }
