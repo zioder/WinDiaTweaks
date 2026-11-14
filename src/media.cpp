@@ -430,6 +430,7 @@ std::wstring Plain(const std::wstring& title) {
 
 struct Row {
     mux::FrameworkElement el{nullptr};  // Dia's row (the UserControl whose grid has five columns)
+    muxc::Grid grid{nullptr};           // its content: the five-column grid (what a card remembers, see RowRef)
     muxc::Button speaker{nullptr};      // column 2: Dia's sound / mute button, shown while the tab has sound
     std::wstring title;
     std::wstring glyph;
@@ -447,6 +448,7 @@ bool ReadRow(const muxc::UserControl& uc, Row& r) {
     auto g = uc.Content().try_as<muxc::Grid>();
     if (!g || g.ColumnDefinitions().Size() != 5) return false;
     r.el = uc;
+    r.grid = g;
     if (auto b = uc.Background().try_as<muxm::SolidColorBrush>()) r.active = b.Color().A == 255;  // the selected tab
     for (auto const& c : g.Children()) {
         auto fe = c.try_as<mux::FrameworkElement>();
@@ -479,8 +481,27 @@ bool ReadRow(const muxc::UserControl& uc, Row& r) {
     return true;
 }
 
+// Dia's tab rows are its own controls, written in Swift. They aren't kept between ticks, not even weakly: a
+// weak reference to one is made by Dia's Swift side, and resolving it once Dia has let the row go makes
+// Swift's runtime stop the process. Feeds that swap tabs' sound on and off quickly (Instagram reels) did that
+// within seconds (#63). The row's content grid is plain XAML: that's what's kept, and the row is found from
+// it while it's still in the tree.
+using RowRef = winrt::weak_ref<muxc::Grid>;
+
+muxc::UserControl RowFrom(const RowRef& ref) {
+    auto g = ref.get();
+    if (!g) return nullptr;
+    mux::DependencyObject d = g;
+    for (int i = 0; i < 3; i++) {
+        d = muxm::VisualTreeHelper::GetParent(d);
+        if (!d) return nullptr;
+        if (auto uc = d.try_as<muxc::UserControl>()) return uc.Content() == g ? uc : nullptr;
+    }
+    return nullptr;
+}
+
 struct RowCache {
-    std::vector<winrt::weak_ref<muxc::UserControl>> rows;
+    std::vector<RowRef> rows;
     unsigned long long revision = ~0ull;
     ULONGLONG scanned = 0;
 };
@@ -496,7 +517,7 @@ std::vector<Row> RowsIn(const mux::FrameworkElement& paging, const mux::UIElemen
             if (auto uc = d.try_as<muxc::UserControl>()) {
                 auto grid = uc.Content().try_as<muxc::Grid>();
                 if (grid && grid.ColumnDefinitions().Size() == 5) {
-                    cache.rows.push_back(winrt::make_weak(uc));
+                    cache.rows.push_back(winrt::make_weak(grid));
                     return false;
                 }
             }
@@ -506,8 +527,8 @@ std::vector<Row> RowsIn(const mux::FrameworkElement& paging, const mux::UIElemen
         cache.scanned = now;
     }
     // Sound, title, selection and favicon stay live; only discovery of the tab controls is cached.
-    for (auto& weak : cache.rows) {
-        auto uc = weak.get();
+    for (auto& ref : cache.rows) {
+        auto uc = RowFrom(ref);
         if (!uc || !uc.IsLoaded()) { cache.revision = ~0ull; continue; }
         Row row;
         if (uc.ActualHeight() > 0 && ReadRow(uc, row)) out.push_back(std::move(row));
@@ -1022,7 +1043,7 @@ struct Card {
     bool active = true;
     Host* host = nullptr;
     std::weak_ptr<Host> owner;
-    winrt::weak_ref<mux::FrameworkElement> row;  // Dia's tab row
+    RowRef row;  // Dia's tab row
     std::wstring title;
     bool dismissed = false, smtc = false, playing = false, muted = false, shown = false;
     bool dragging = false;
@@ -1088,7 +1109,7 @@ struct Host : std::enable_shared_from_this<Host> {
     double lastFrame = 0;
     winrt::event_token render{}, sizeChanged{};
     Smtc smtc;  // (as last read, for the progress bar between reads)
-    winrt::weak_ref<mux::FrameworkElement> smtcRow;  // the tab the media session was last matched to
+    RowRef smtcRow;  // the tab the media session was last matched to
     int smtcSession = -1;                            // (and which session that was)
     Smtc lastGood;            // the session as it last was with a song (ridden over a blank moment)
     ULONGLONG lastGoodAt = 0;
@@ -1114,7 +1135,7 @@ CardAccess LockCard(const std::weak_ptr<Card>& weak) {
 
 thread_local std::map<void*, std::shared_ptr<Host>> t_hosts;
 thread_local struct {
-    winrt::weak_ref<mux::FrameworkElement> row;  // a tab to tap once it's scrolled into view
+    RowRef row;  // a tab to tap once it's scrolled into view
     std::weak_ptr<Host> host;
     int tries = 0;
 } t_goTo;
@@ -1231,7 +1252,7 @@ bool TapRow(Host& h, const mux::FrameworkElement& row) {
 
 // Goes to the card's tab. The card sinks away at once, not when Dia gets there.
 void GoToTab(Card& c) {
-    auto row = c.row.get();
+    auto row = RowFrom(c.row);
     if (!row || !row.XamlRoot()) return;
     c.hideUntil = GetTickCount64() + 1500;
     Leave(c);
@@ -1239,12 +1260,11 @@ void GoToTab(Card& c) {
     mux::BringIntoViewOptions opts;
     opts.AnimationDesired(false);
     row.StartBringIntoView(opts);
-    t_goTo.row = winrt::make_weak(row), t_goTo.host = c.owner, t_goTo.tries = 10;  // tapped once it's in view (Media_Tick)
+    t_goTo.row = c.row, t_goTo.host = c.owner, t_goTo.tries = 10;  // tapped once it's in view (Media_Tick)
 }
 
 void PressSpeaker(Card& c) {
-    auto row = c.row.get();
-    muxc::UserControl uc = row ? row.try_as<muxc::UserControl>() : nullptr;
+    muxc::UserControl uc = RowFrom(c.row);
     Row r;
     if (!uc || !ReadRow(uc, r) || !r.speaker) return Log("media: no sound button on the tab");
     try {
@@ -1907,14 +1927,14 @@ void UpdateHost(Host& h, const muxc::Grid& paging, const Smtc& now_, bool pip, C
             if (Matches(r.title, s.title)) smtcRow = &r;
         if (!smtcRow && s.session == h.smtcSession)
             for (auto& r : rows)
-                if (r.el == h.smtcRow.get()) smtcRow = &r;
+                if (r.grid == h.smtcRow.get()) smtcRow = &r;
         if (!smtcRow) {
             int n = 0;
             for (auto& r : rows)
                 if (r.audible) n++, smtcRow = &r;
             if (n != 1) smtcRow = nullptr;
         }
-        if (smtcRow) h.smtcRow = winrt::make_weak(smtcRow->el), h.smtcSession = s.session;
+        if (smtcRow) h.smtcRow = winrt::make_weak(smtcRow->grid), h.smtcSession = s.session;
     }
 
     std::vector<std::shared_ptr<Card>> keep, shown;
@@ -1923,13 +1943,13 @@ void UpdateHost(Host& h, const muxc::Grid& paging, const Smtc& now_, bool pip, C
         bool isSmtc = &r == smtcRow;
         std::shared_ptr<Card> card;
         for (auto& c : h.cards)
-            if (c->row.get() == r.el) card = c;
+            if (c->row.get() == r.grid) card = c;
         bool sound = r.audible || (isSmtc && s.playing);
         bool fresh = false;
         if (!card) {
             if (!sound) continue;
             card = MakeCard(h);
-            card->row = winrt::make_weak(r.el);
+            card->row = winrt::make_weak(r.grid);
             ApplyTheme(*card, theme);
             Park(h, *card);  // (built now, while its tab plays in front; shown when you switch away)
             fresh = true;
@@ -2057,7 +2077,7 @@ void Media_Tick() {
     static thread_local int tick = 0;
     tick++;
     if (t_goTo.tries > 0) {
-        auto row = t_goTo.row.get();
+        auto row = RowFrom(t_goTo.row);
         auto host = t_goTo.host.lock();
         if (!host || !host->active || !row || TapRow(*host, row) || --t_goTo.tries == 0)
             t_goTo.tries = 0, t_goTo.row = nullptr, t_goTo.host.reset();
