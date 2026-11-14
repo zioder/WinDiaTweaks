@@ -2141,6 +2141,9 @@ struct TidyRow {
     winrt::weak_ref<muxc::Button> diaClear;         // (sep) Dia's Clear Tabs button, kept out of sight
     wf::IInspectable diaClearMaxW{nullptr}, diaSepHit{nullptr};  // (sep) Dia's own values, put back on removal
     int64_t sepHitToken = 0;                        // (sep) keeps the divider clickable
+    ULONGLONG hitWindow = 0;                        // (sep) Dia turning hit testing back off: how often...
+    int hitFights = 0;
+    bool hitGaveUp = false;                         // ...and, if it keeps doing so, we stop (no tug of war)
 };
 static thread_local std::vector<std::shared_ptr<TidyRow>> t_tidyRows;
 static thread_local winrt::event_token t_tidyFrame{};
@@ -3302,14 +3305,36 @@ static bool TidyAnimate() {
     return more;
 }
 
+// While subscribed to CompositionTarget.Rendering, WinUI draws every frame (UI thread, compositor and GPU
+// process all busy), so the loop must end. It ends by itself once nothing moves; as a safety net it's also
+// cut after a while (the 100 ms tick keeps Tidy's steps going, and the next hover or click restarts it).
 static void EnsureTidyFrames() {
     if (t_tidyAnimating) return;
     t_tidyAnimating = true;
+    static thread_local ULONGLONG since = 0;
+    since = GetTickCount64();
     t_tidyFrame = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
         bool more = false;
         try {
             more = TidyAnimate();
         } catch (...) {
+        }
+        ULONGLONG ran = GetTickCount64() - since;
+        if (more && ran > (TidyBusy() ? 30000u : 8000u) && !t_clear.phase) {
+            static thread_local int logged = 0;
+            if (logged++ < 5)
+                Log("tidy: frame loop ran %llums (busy %d, quiet %d, freeze %d, rows %zu): stopped", ran, (int)t_tidy.step,
+                    (int)Tidy_Quiet(), t_freeze ? 1 : 0, t_tidyRows.size());
+            bool always = TidyOptions().always;
+            for (auto& p : t_tidyRows) {  // (land the rows where they're going)
+                if (p->hideAt) p->hideAt = 0, p->target = TidyWant(*p, always);
+                p->progress = p->target;
+            }
+            try {
+                TidyAnimate();
+            } catch (...) {
+            }
+            more = false;
         }
         if (!more) {
             muxm::CompositionTarget::Rendering(t_tidyFrame);
@@ -3637,11 +3662,22 @@ static std::shared_ptr<TidyRow> BuildTidySep(const muxc::ScrollViewer& sv, const
     rec->row = winrt::make_weak(row);
     rec->diaSepHit = sep.ReadLocalValue(mux::UIElement::IsHitTestVisibleProperty());
     sep.IsHitTestVisible(true);
-    rec->sepHitToken = sep.RegisterPropertyChangedCallback(mux::UIElement::IsHitTestVisibleProperty(),
-                                                           [](mux::DependencyObject const& o, mux::DependencyProperty const&) {
-                                                               if (auto g = o.try_as<mux::UIElement>(); g && !g.IsHitTestVisible())
-                                                                   g.IsHitTestVisible(true);
-                                                           });
+    std::weak_ptr<TidyRow> weakRec = rec;
+    rec->sepHitToken = sep.RegisterPropertyChangedCallback(
+        mux::UIElement::IsHitTestVisibleProperty(), [weakRec](mux::DependencyObject const& o, mux::DependencyProperty const&) {
+            auto g = o.try_as<mux::UIElement>();
+            auto p = weakRec.lock();
+            if (!g || g.IsHitTestVisible() || !p || p->hitGaveUp) return;
+            // Dia turning it back off again and again: leave it to Dia rather than fight every frame.
+            ULONGLONG now = GetTickCount64();
+            if (now - p->hitWindow > 1000) p->hitWindow = now, p->hitFights = 0;
+            if (++p->hitFights > 10) {
+                p->hitGaveUp = true;
+                Log("tidy: Dia keeps its divider unclickable: left as is");
+                return;
+            }
+            g.IsHitTestVisible(true);
+        });
     StyleButtons(*rec);
     TrackTidyHover(rec, root);
     Log("tidy: buttons put in Dia's divider (%s)", N(rec->look).c_str());
@@ -3746,21 +3782,52 @@ static void PlaceTidyStrip(TidyRow& r) {
     }
 }
 
+// Any tab row at all (as AllTabRows, but stops at the first one).
+static bool AnyTabRow() {
+    for (auto h : FindNodes(L"RowsPanel"))
+        if (auto rows = Obj<mux::FrameworkElement>(h); rows && rows.ActualHeight() > 0)
+            if (FirstIn(rows, [](const mux::FrameworkElement& fe) {
+                    auto uc = fe.try_as<muxc::UserControl>();
+                    auto g = uc ? uc.Content().try_as<muxc::Grid>() : nullptr;
+                    return g && g.ColumnDefinitions().Size() == 5;
+                }))
+                return true;
+    return false;
+}
+
+// Runs on the 100 ms tick. Looking through the tab list (every tab's elements) is the costly part, so it
+// happens every 5th tick (or right away while Tidy or Clear works, or with no rows yet); the ticks between
+// only check that our rows are still there. Hovers and clicks don't wait for it (they have handlers).
 static void UpdateTidyTabs() {
     CheckFreeze();
     RunTidySteps();
     CheckUnpark();
     bool on = Engine_TweakOn(L"tidyTabs");
+    static thread_local unsigned tick = 0;
+    static thread_local bool wasOn = false;
+    bool full = ++tick % 5 == 0 || TidyBusy() || t_clear.phase || (on && !wasOn);
+    wasOn = on;
+    if (on && !full) {
+        for (auto& p : t_tidyRows) {
+            if (!p->row.get() || !p->root.get()) full = true;
+            if (auto host = p->strip && p->reserved ? p->stripHost.get() : nullptr) {  // (Dia may lay it out again)
+                double w = (p->look.size() - 1) * 24.4 + 6;
+                auto m = host.Margin();
+                if (std::abs(m.Right - (p->diaMargin.Right + w)) > 0.5) host.Margin({m.Left, m.Top, p->diaMargin.Right + w, m.Bottom});
+            }
+        }
+        if (!full) return;
+    }
     auto look = TidyOptions();
     for (auto it = t_tidyRows.begin(); it != t_tidyRows.end();) {
         auto& r = **it;
         auto host = r.root.get();
         auto sh = r.stripHost.get();
         bool gone = r.strip ? (!sh || !sh.IsLoaded() || sh.ActualWidth() <= 0) : !r.scroll.get();
-        if (r.sep && !gone) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
+        if (r.sep && !gone && on) {  // Dia's divider went, or now asks to confirm (Dia's own button then)
             auto g = r.sepGrid.get();
             gone = !g || DiaPinnedSep(r.scroll.get()) != g;
-            if (g && !gone && !g.IsHitTestVisible()) g.IsHitTestVisible(true);
+            if (g && !gone && !g.IsHitTestVisible() && !r.hitGaveUp) g.IsHitTestVisible(true);
         }
         bool stale = gone || !r.row.get() || !host || (r.look != (r.strip ? StripLook(look) : look.key()) && !TidyBusy());
         if (!on || stale) {
@@ -3770,6 +3837,19 @@ static void UpdateTidyTabs() {
             ++it;
     }
     if (!on) return;
+    // Rows that keep going stale and being rebuilt (Dia relaying out the list under them) would rebuild
+    // every tick: after 8 builds in 10 s, no new ones for 10 s.
+    static thread_local ULONGLONG buildWindow = 0, buildPause = 0;
+    static thread_local int builds = 0;
+    ULONGLONG nowMs = GetTickCount64();
+    if (nowMs - buildWindow > 10000) buildWindow = nowMs, builds = 0;
+    bool canBuild = nowMs >= buildPause;
+    auto built = [&] {
+        if (++builds > 8 && canBuild) {
+            Log("tidy: rows rebuilt %d times in 10 s: pausing", builds);
+            buildPause = nowMs + 10000, canBuild = false;
+        }
+    };
     // Dia's own divider is up asking to confirm Close All Tabs: ours shuts. (The lasting one below pinned
     // tabs takes the buttons instead: see BuildTidySep.)
     bool diaLine = false;
@@ -3782,22 +3862,26 @@ static void UpdateTidyTabs() {
         if (!root || root.Name() != L"RootGrid") continue;
         auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return !p->sep && p->scroll.get() == sv; });
         if (it == t_tidyRows.end()) {
+            if (!canBuild) continue;
             t_tidyRows.push_back(BuildTidyRow(sv, root, look));
             it = std::prev(t_tidyRows.end());
+            built();
         }
         auto& r = **it;
         // Pinned tabs: the buttons are in Dia's divider below them, and our row stays shut.
         auto sep = DiaPinnedSep(sv);
         // Any tabs in the list, loose or in groups (Clear and a new Tidy both apply to grouped tabs too).
-        bool tabs = TabsBelow(sv) > 0 || !AllTabRows().empty();
+        bool tabs = TabsBelow(sv) > 0 || AnyTabRow();
         r.eligible = !diaLine && !sep && tabs;
         double want = TidyWant(r, look.always);
         if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
         if (!sep) continue;
         auto si = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->sep && p->sepGrid.get() == sep; });
         if (si == t_tidyRows.end()) {
+            if (!canBuild) continue;
             t_tidyRows.push_back(BuildTidySep(sv, root, sep, look));
             si = std::prev(t_tidyRows.end());
+            built();
             if (TidyBusy()) ShowWave(*si, true), (*si)->target = 1;
         }
         auto& s = **si;
@@ -3810,10 +3894,12 @@ static void UpdateTidyTabs() {
         if (!host || !host.IsLoaded() || host.ActualWidth() <= 0) continue;
         auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->strip && p->stripHost.get() == host; });
         if (it == t_tidyRows.end()) {
+            if (!canBuild) continue;
             auto rec = BuildTidyStrip(host, look);
             if (!rec) continue;
             t_tidyRows.push_back(rec);
             it = std::prev(t_tidyRows.end());
+            built();
         }
         auto& r = **it;
         PlaceTidyStrip(r);
