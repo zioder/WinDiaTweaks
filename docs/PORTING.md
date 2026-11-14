@@ -65,6 +65,7 @@ Verified in Dia on this machine with screenshots (on, then off again, unless not
 |---|---|---|
 | Edge-to-edge web content | `edgeToEdge` | Done. Dia only adds the gap in some window states; maximized has none. |
 | Square corners by the sidebar | `squareCorners` | Done, verified (normal and maximized window). Squares Dia's rounded UI corners around the page. The web page's own bottom corners are rounded inside Dia's engine (`roundsContentCorners` in Dia's Swift code), so the page is stretched ~9 px past the bottom of the window and Windows clips the rounded corners off; the last ~9 px of the page sit below the window edge. |
+| *(new)* Hide link address | `hideLinkAddress` | Done, verified. Collapses the link address bubble (the `RootGrid` holding `StatusText`, bottom left of the page). Dia keeps setting its text, so Peek's hovered-link lookup still works. |
 | Hide toolbar | `hideToolbar` | Done, verified. The window buttons fade out with the toolbar and back in when it's revealed; while hidden they can't be clicked by accident. |
 | Reveal toolbar on hover | *(merged into `hideToolbar`)* | Done, verified. Hide toolbar now always slides the toolbar back in while the pointer is at the top edge. |
 | Show toolbar with the sidebar | `showToolbarWithSidebar` | Done, verified (sidebar open → shown, closed → hidden). |
