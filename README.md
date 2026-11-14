@@ -26,6 +26,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | **Page** | |
 | Edge-to-edge web content | Removes the gap between pages and the window edge |
 | Square corners by the sidebar | Pages meet the sidebar and window edges with straight corners |
+| Hide link address ✨ | Hides the address Dia shows at the bottom left while the pointer is over a link |
 | **Toolbar** | |
 | Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
