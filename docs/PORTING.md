@@ -54,8 +54,12 @@ diagnostics API. From there:
   clicks; Dia's own shape comes back when the toolbar shows. On Dia's start page (New Tab), which is drawn in
   XAML, the toolbar slide runs as a compositor translation with the page height kept constant, so it doesn't
   re-lay out the start page every frame.
-- **Safe mode** (as on macOS): if Dia closes twice in a row within a minute of starting with tweaks, the next
-  start runs with tweaks off and Settings → Patches shows a "Turn patches back on" button.
+- **Safe mode** (as on macOS): if Dia closes twice in a row within a minute of starting with tweaks, or two
+  sessions in a row end in a crash the add-on caught (at any point; counted in `crash.state`, cleared by a
+  clean exit), the next start runs with tweaks off and Settings → Patches shows a "Turn patches back on" button.
+- **Crash report**: a vectored exception handler writes Swift trap / Chromium CHECK crashes (code, stack as
+  module+offset with the nearest export, tweaks on) to `crash.log`, and the C runtime's standard error, where
+  Swift prints its `Fatal error` line, is pointed there too. It only observes; the crash then goes on as before.
 
 ## Tweaks — macOS list vs Windows
 

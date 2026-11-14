@@ -110,6 +110,9 @@ static std::vector<Tweak> g_tweaks;
 // user turns tweaks back on from Settings > Patches.
 static bool g_safeMode = false;
 static void CheckSafeMode();
+static void NoteTweaksForCrashReport();
+static void InstallCrashReport();
+static void ClearCrashCount();
 static DWORD WINAPI StableTimer(LPVOID);
 static void ApplyPinnedExtensionsLimit();
 static std::vector<Rule> g_rules;
@@ -216,6 +219,7 @@ static void LoadConfig() {
     g_rules = rules;
     g_valueCache.clear();
     Log("config: %zu tweaks, %zu rules", tweaks.size(), rules.size());
+    NoteTweaksForCrashReport();
 }
 
 static bool TweakOn(const std::wstring& key) {
@@ -839,6 +843,7 @@ public:
         // Tells diatweaks the tweaks are live. Kept open (and set) for as long as Dia runs.
         static HANDLE attached = CreateEventW(
             nullptr, TRUE, TRUE, (DT_EVENT_ATTACHED + std::to_wstring(GetCurrentProcessId())).c_str());
+        InstallCrashReport();
         CheckSafeMode();
         CloseHandle(CreateThread(nullptr, 0, StableTimer, nullptr, 0, nullptr));
         LoadConfig();
@@ -1100,6 +1105,7 @@ bool Engine_Hover() { return g_hoverTop; }
 void Engine_LeaveSafeMode() {
     g_safeMode = false;
     DeleteFileW((g_dir + L"\\launch.state").c_str());
+    DeleteFileW((g_dir + L"\\crash.state").c_str());
     Log("safe mode off");
     ApplyConfigNow();
 }
@@ -1140,18 +1146,179 @@ IInspectable* Engine_Object(InstanceHandle h) {
 
 // launch.state holds how many tweaked starts in a row ended within a minute (a clean exit or a full
 // minute of running clears it). Two such starts in a row turn on safe mode for the next one.
+// crash.state holds how many sessions in a row ended in a crash the add-on saw (see the crash report
+// below), however long Dia had been running. Only a clean exit clears it. Two in a row also turn on
+// safe mode, so a crash minutes in (#63) can't repeat forever.
+static int ReadCount(const std::wstring& path) {
+    int n = 0;
+    std::ifstream in(path);
+    in >> n;
+    return n;
+}
 static void CheckSafeMode() {
     std::wstring path = g_dir + L"\\launch.state";
-    int previous = 0;
-    {
-        std::ifstream in(path);
-        in >> previous;
-    }
-    g_safeMode = previous >= 2;
+    int previous = ReadCount(path);
+    int crashes = ReadCount(g_dir + L"\\crash.state");
+    g_safeMode = previous >= 2 || crashes >= 2;
     std::ofstream out(path, std::ios::binary);
     out << (previous + 1);
-    if (g_safeMode) Log("safe mode: %d quick exits in a row, tweaks are off", previous);
+    if (previous >= 2) Log("safe mode: %d quick exits in a row, tweaks are off", previous);
+    else if (g_safeMode) Log("safe mode: Dia crashed %d times in a row (see crash.log), tweaks are off", crashes);
 }
+
+// ---------------------------------------------------------------- crash report
+// Dia's Swift runtime catches its own crashes and hands them to swift-backtrace.exe, which (at least on
+// some Windows builds) dies itself before writing anything, and Windows logs no crash for Dia (#63). So
+// the add-on writes what it can see to crash.log: Swift's "Fatal error" line (the runtime writes it to
+// standard error, which a windowed app doesn't have, so it's pointed at crash.log) and, for a crash, the
+// code, the stack (module+offset, with the nearest exported name: Swift's exported symbols name the
+// function) and which tweaks were on. Nothing is changed about how the crash then proceeds.
+
+static HANDLE g_crashFile = INVALID_HANDLE_VALUE;
+static char g_crashTweaks[1024] = "";  // enabled tweaks, kept ready (the handler can't take locks)
+static std::atomic<int> g_crashReports{0}, g_avReports{0};
+
+static void NoteTweaksForCrashReport() {
+    std::string s;
+    for (auto& t : g_tweaks)
+        if (t.enabled && t.key != L"preset" && !t.noSwitch) {
+            if (!s.empty()) s += ' ';
+            s += Wide2Narrow(t.key);
+            if (!t.value.empty()) s += "=" + Wide2Narrow(t.value);
+        }
+    if (g_safeMode) s = "(safe mode) " + s;
+    strncpy_s(g_crashTweaks, s.c_str(), _TRUNCATE);
+}
+
+static void CrashWrite(const char* s) {
+    DWORD n;
+    if (g_crashFile != INVALID_HANDLE_VALUE) WriteFile(g_crashFile, s, (DWORD)strlen(s), &n, nullptr);
+}
+
+// "Dia.dll+0x1234 ($s3Dia7TabViewC6updateyyF+0x40)". Reads only the module's own headers.
+static void DescribeAddress(DWORD64 addr, char* out, size_t cap) {
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCWSTR)addr, &m) || !m) {
+        snprintf(out, cap, "0x%llx", (unsigned long long)addr);
+        return;
+    }
+    char path[MAX_PATH] = "";
+    GetModuleFileNameA(m, path, MAX_PATH);
+    const char* base = strrchr(path, '\\');
+    base = base ? base + 1 : path;
+    BYTE* img = (BYTE*)m;
+    DWORD64 rva = addr - (DWORD64)img;
+    const char* best = nullptr;
+    DWORD bestRva = 0;
+    auto nt = (IMAGE_NT_HEADERS*)(img + ((IMAGE_DOS_HEADER*)img)->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (dir.VirtualAddress && dir.Size) {
+        auto ex = (IMAGE_EXPORT_DIRECTORY*)(img + dir.VirtualAddress);
+        auto names = (DWORD*)(img + ex->AddressOfNames);
+        auto ords = (WORD*)(img + ex->AddressOfNameOrdinals);
+        auto funcs = (DWORD*)(img + ex->AddressOfFunctions);
+        for (DWORD i = 0; i < ex->NumberOfNames; i++) {
+            DWORD f = funcs[ords[i]];
+            if (f <= rva && f > bestRva) bestRva = f, best = (const char*)(img + names[i]);
+        }
+    }
+    if (best) snprintf(out, cap, "%s+0x%llx (%.400s+0x%llx)", base, (unsigned long long)rva, best,
+                       (unsigned long long)(rva - bestRva));
+    else snprintf(out, cap, "%s+0x%llx", base, (unsigned long long)rva);
+}
+
+static bool ReadReturnAddress(DWORD64 rsp, DWORD64* out) {
+    __try {
+        *out = *(DWORD64*)rsp;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    // A Swift trap (fatalError, a failed `try!`, a nil unwrap, an index out of range) is an illegal
+    // instruction; Chromium's CHECKs are a breakpoint or an illegal instruction. Access violations can be
+    // handled further on, so only the first few are written (as "maybe").
+    bool fatal = code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_BREAKPOINT;
+    if (!fatal && code != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    if (g_crashFile == INVALID_HANDLE_VALUE || (fatal ? g_crashReports : g_avReports).fetch_add(1) >= 3)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (fatal) {
+        // Counted now: the process won't get to say anything after this.
+        int n = ReadCount(g_dir + L"\\crash.state");
+        HANDLE f = CreateFileW((g_dir + L"\\crash.state").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            char b[16];
+            snprintf(b, sizeof(b), "%d", n + 1);
+            DWORD w;
+            WriteFile(f, b, (DWORD)strlen(b), &w, nullptr);
+            CloseHandle(f);
+        }
+    }
+    char line[1024];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(line, sizeof(line),
+             "\r\n*** %04d-%02d-%02d %02d:%02d:%02d.%03d %s 0x%08lx on thread %lu (Dia pid %lu)\r\n",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
+             fatal ? "crash" : "maybe a crash: access violation", code, GetCurrentThreadId(), GetCurrentProcessId());
+    CrashWrite(line);
+    snprintf(line, sizeof(line), "tweaks on: %s\r\n", g_crashTweaks[0] ? g_crashTweaks : "(none)");
+    CrashWrite(line);
+    CONTEXT ctx = *ep->ContextRecord;
+    char where[700];
+    for (int i = 0; i < 64 && ctx.Rip; i++) {
+        DescribeAddress(ctx.Rip, where, sizeof(where));
+        snprintf(line, sizeof(line), "  %2d %s\r\n", i, where);
+        CrashWrite(line);
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(ctx.Rip, &imageBase, nullptr);
+        if (fn) {
+            PVOID handlerData;
+            DWORD64 establisher;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, ctx.Rip, fn, &ctx, &handlerData, &establisher, nullptr);
+        } else {  // a leaf function: the return address is on top of the stack
+            DWORD64 ret;
+            if (!ReadReturnAddress(ctx.Rsp, &ret)) break;
+            ctx.Rip = ret;
+            ctx.Rsp += 8;
+        }
+    }
+    FlushFileBuffers(g_crashFile);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static void InstallCrashReport() {
+    std::wstring path = g_dir + L"\\crash.log";
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 512 * 1024)
+        MoveFileExW(path.c_str(), (path + L".prev").c_str(), MOVEFILE_REPLACE_EXISTING);
+    g_crashFile = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (g_crashFile == INVALID_HANDLE_VALUE) return Log("crash report: can't open crash.log (%lu)", GetLastError());
+    AddVectoredExceptionHandler(1, CrashHandler);
+    // Point the C runtime's standard error (the one Swift's runtime writes its fatal errors to) at
+    // crash.log, unless Dia was started with somewhere to write it already.
+    HMODULE ucrt = GetModuleHandleW(L"ucrtbase.dll");
+    auto openHandle = ucrt ? (int(__cdecl*)(intptr_t, int))GetProcAddress(ucrt, "_open_osfhandle") : nullptr;
+    auto dup2 = ucrt ? (int(__cdecl*)(int, int))GetProcAddress(ucrt, "_dup2") : nullptr;
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    bool hasStderr = err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_UNKNOWN;
+    if (openHandle && dup2 && !hasStderr) {
+        HANDLE dup = nullptr;
+        DuplicateHandle(GetCurrentProcess(), g_crashFile, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        int fd = dup ? openHandle((intptr_t)dup, 0x0008 /* _O_APPEND */) : -1;
+        if (fd >= 0 && dup2(fd, 2) == 0) Log("crash report: on (standard error goes to crash.log)");
+        else Log("crash report: on (standard error not redirected)");
+    } else {
+        Log("crash report: on");
+    }
+}
+
+static void ClearCrashCount() { DeleteFileW((g_dir + L"\\crash.state").c_str()); }
 static DWORD WINAPI StableTimer(LPVOID) {
     Sleep(60000);
     if (!g_safeMode) DeleteFileW((g_dir + L"\\launch.state").c_str());
@@ -1321,6 +1488,7 @@ BOOL APIENTRY DllMain(HMODULE m, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_DETACH && g_diag && !g_safeMode) {
         // Dia is closing normally: not a crash.
         DeleteFileW((g_dir + L"\\launch.state").c_str());
+        ClearCrashCount();
     }
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = m;
