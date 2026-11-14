@@ -197,7 +197,7 @@ Loading an add-on into another app is something antivirus software watches for. 
 
 WinDiaTweaks watches for that: after two launches in a row where Dia closes almost immediately, or two sessions in a row that end in a crash (however long Dia ran first), the next launch skips the tweaks (safe mode). Once things are sorted, re-enable them from the button at the top of **Settings → Patches**.
 
-When Dia crashes with the tweaks loaded, WinDiaTweaks writes what it saw to `crash.log` in its folder (`bin` for an installed release): Swift's `Fatal error` message, the crashing stack and which tweaks were on. Dia's own crash reporter (`swift-backtrace.exe`) often dies before it can show anything, so please attach `crash.log` and `tap.log` to the issue.
+When Dia crashes with the tweaks loaded, WinDiaTweaks writes what it saw to `crash.log` in its folder (`bin` for an installed release): Swift's `Fatal error` message, the crashing stack and which tweaks were on. Dia's own crash reporter (`swift-backtrace.exe`) often dies before it can show anything, so please attach `crash.log` and `tap.log` to the issue (the [bug report form](https://github.com/zioder/WinDiaTweaks/issues/new?template=bug_report.md) lists what to include).
 
 After Dia updates, if you build WinDiaTweaks yourself, delete `gen` and `winmd` and run `build.cmd` again, so it's built against the WinUI that ships with the new Dia.
 
