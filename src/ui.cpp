@@ -1932,6 +1932,7 @@ struct PageStretch {
     mux::Thickness saved{};
 };
 static thread_local std::vector<PageStretch> t_stretch;
+static thread_local std::vector<PageStretch> t_statusLift;  // link-hover bubbles raised above the overhang
 static thread_local bool t_sliding = false;  // the hidden toolbar is mid-slide; don't fight it
 static const double kCornerOverhang = 9;    // > Dia's 7px corner radius
 
@@ -1945,14 +1946,52 @@ static std::vector<mux::FrameworkElement> PageContentHosts() {
     return out;
 }
 
+// The link address bubble Dia shows at the bottom left of the page sits inside the stretched page, so
+// the part that hangs past the window's bottom edge would be cut off: raise it by that much.
+static void LiftStatusBubbles(const std::vector<std::pair<mux::FrameworkElement, double>>& overhangs) {
+    for (auto h : FindNodes(L"StatusText")) {
+        auto tb = Obj<mux::FrameworkElement>(h);
+        if (!tb) continue;
+        auto bubble = muxm::VisualTreeHelper::GetParent(tb).try_as<mux::FrameworkElement>();
+        if (!bubble) continue;
+        double lift = 0;
+        for (mux::DependencyObject d = bubble; d; d = muxm::VisualTreeHelper::GetParent(d)) {
+            auto it = std::find_if(overhangs.begin(), overhangs.end(), [&](auto const& o) { return o.first == d; });
+            if (it != overhangs.end()) {
+                lift = it->second;
+                break;
+            }
+        }
+        PageStretch* st = nullptr;
+        for (auto& p : t_statusLift)
+            if (p.host.get() == bubble) st = &p;
+        if (!st) {
+            if (lift < 0.5) continue;
+            t_statusLift.push_back({winrt::make_weak(bubble), bubble.Margin()});
+            st = &t_statusLift.back();
+        }
+        auto m = st->saved;
+        m.Bottom += lift;
+        auto cur = bubble.Margin();
+        if (std::abs(cur.Bottom - m.Bottom) >= 0.5) bubble.Margin(m);
+    }
+    t_statusLift.erase(std::remove_if(t_statusLift.begin(), t_statusLift.end(),
+                                      [](const PageStretch& p) { return !p.host.get(); }),
+                       t_statusLift.end());
+}
+
 static void StretchPage(bool on) {
     if (!on) {
         for (auto& p : t_stretch)
             if (auto fe = p.host.get()) fe.Margin(p.saved);
         t_stretch.clear();
+        for (auto& p : t_statusLift)
+            if (auto fe = p.host.get()) fe.Margin(p.saved);
+        t_statusLift.clear();
         return;
     }
     if (t_sliding) return;
+    std::vector<std::pair<mux::FrameworkElement, double>> overhangs;  // host -> how far it hangs past the window
     for (auto const& fe : PageContentHosts()) {
         if (fe.ActualHeight() < 1) continue;
         PageStretch* st = nullptr;
@@ -1966,12 +2005,17 @@ static void StretchPage(bool on) {
         if (!root) continue;
         double bottom = fe.TransformToVisual(root).TransformPoint({0, 0}).Y + fe.ActualHeight();
         double delta = root.ActualHeight() + kCornerOverhang - bottom;  // how far the page must still grow
-        if (std::abs(delta) < 0.5) continue;
-        auto m = fe.Margin();
-        m.Bottom -= delta;
-        if (m.Bottom > st->saved.Bottom) m.Bottom = st->saved.Bottom;  // never shrink the page
-        fe.Margin(m);
+        if (std::abs(delta) >= 0.5) {
+            auto old = fe.Margin();
+            auto m = old;
+            m.Bottom -= delta;
+            if (m.Bottom > st->saved.Bottom) m.Bottom = st->saved.Bottom;  // never shrink the page
+            fe.Margin(m);
+            bottom += old.Bottom - m.Bottom;
+        }
+        overhangs.emplace_back(fe, (std::max)(0.0, bottom - root.ActualHeight()));
     }
+    LiftStatusBubbles(overhangs);
 }
 
 static void UpdateSquareCorners() {
