@@ -26,6 +26,7 @@
 #include <shlobj.h>
 
 #include "engine.h"
+#include "llhook.h"
 #include "shared.h"
 #pragma comment(lib, "uuid.lib")
 
@@ -110,6 +111,7 @@ static std::vector<Tweak> g_tweaks;
 // user turns tweaks back on from Settings > Patches.
 static bool g_safeMode = false;
 static void CheckSafeMode();
+static void InstallCrashGuard();
 static DWORD WINAPI StableTimer(LPVOID);
 static void ApplyPinnedExtensionsLimit();
 static std::vector<Rule> g_rules;
@@ -836,6 +838,7 @@ public:
         hr = site->QueryInterface(__uuidof(IVisualTreeService2), (void**)&g_vts);
         if (FAILED(hr)) return Log("no IVisualTreeService2 0x%08lx", hr), hr;
         Log("attached to Dia (pid %lu)", GetCurrentProcessId());
+        InstallCrashGuard();
         // Tells diatweaks the tweaks are live. Kept open (and set) for as long as Dia runs.
         static HANDLE attached = CreateEventW(
             nullptr, TRUE, TRUE, (DT_EVENT_ATTACHED + std::to_wstring(GetCurrentProcessId())).c_str());
@@ -1134,6 +1137,68 @@ IInspectable* Engine_Object(InstanceHandle h) {
     IInspectable* out = nullptr;
     if (FAILED(g_diag->GetIInspectableFromHandle(h, &out))) return nullptr;
     return out;
+}
+
+// ---------------------------------------------------------------- crash guard
+// When Dia crashes, Swift's crash reporter (swift-backtrace) holds Dia stopped while it prints a report
+// and waits for a key. Our low-level input hooks would then stall every mouse move and key press on the
+// PC for as long (zioder/WinDiaTweaks#58). So on a crash the hooks come off first, before the reporter
+// gets to run, and the crash is noted in tap.log (where it happened helps tell Dia's crashes from ours).
+// Nothing here takes a lock or allocates: the crashed thread may hold any of them.
+static wchar_t g_crashLogPath[MAX_PATH];
+static LPTOP_LEVEL_EXCEPTION_FILTER g_prevCrashFilter;
+static std::atomic<bool> g_crashed{false};
+
+static void OnCrash(EXCEPTION_POINTERS* ep) {
+    if (g_crashed.exchange(true)) return;
+    int released = LowLevelHookThread::ReleaseAll();
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    char where[MAX_PATH] = "?";
+    uintptr_t offset = (uintptr_t)er->ExceptionAddress;
+    // (On a stack overflow there's little stack left: just the code and address.)
+    HMODULE mod = nullptr;
+    if (er->ExceptionCode != EXCEPTION_STACK_OVERFLOW &&
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)er->ExceptionAddress, &mod) &&
+        GetModuleFileNameA(mod, where, sizeof(where))) {
+        offset -= (uintptr_t)mod;
+        if (char* slash = strrchr(where, '\\')) memmove(where, slash + 1, strlen(slash));
+    }
+    char line[MAX_PATH + 160];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                        "%02d:%02d:%02d.%03d [%lu] Dia crashed: exception 0x%08lx at %s+0x%llx (%d input hooks "
+                        "taken off)\n",
+                        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, GetCurrentThreadId(),
+                        er->ExceptionCode, where, (unsigned long long)offset, released);
+    HANDLE f = CreateFileW(g_crashLogPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        if (n > 0) WriteFile(f, line, (DWORD)n, &written, nullptr);
+        CloseHandle(f);
+    }
+}
+// First in line for the exceptions that only ever end a program: a Swift runtime error (fatalError,
+// an index out of range, unwrapping nil...) is an illegal instruction.
+static LONG CALLBACK CrashFirstChance(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_STACK_OVERFLOW) OnCrash(ep);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+// Any other exception nothing handled, before passing it on to the handler that was there (Swift's).
+static LONG WINAPI CrashUnhandled(EXCEPTION_POINTERS* ep) {
+    OnCrash(ep);
+    return g_prevCrashFilter ? g_prevCrashFilter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+static void InstallCrashGuard() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    wcsncpy_s(g_crashLogPath, (g_dir + L"\\tap.log").c_str(), _TRUNCATE);
+    AddVectoredExceptionHandler(1, CrashFirstChance);
+    g_prevCrashFilter = SetUnhandledExceptionFilter(CrashUnhandled);
 }
 
 // ---------------------------------------------------------------- safe mode bookkeeping
