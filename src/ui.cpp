@@ -1902,6 +1902,16 @@ static thread_local std::vector<PageStretch> t_stretch;
 static thread_local bool t_sliding = false;  // the hidden toolbar is mid-slide; don't fight it
 static const double kCornerOverhang = 9;    // > Dia's 7px corner radius
 
+// The web page's host: Dia's ContentHost ContentControl. Other elements share the name, such as the
+// ContentPresenter in a MenuFlyoutSeparator's template (Dia's profile menu puts its color row there), so
+// match the type too: stretching or squaring those breaks the menu.
+static std::vector<mux::FrameworkElement> PageContentHosts() {
+    std::vector<mux::FrameworkElement> out;
+    for (auto h : FindNodes(L"ContentHost"))
+        if (auto fe = Obj<muxc::ContentControl>(h)) out.push_back(fe);
+    return out;
+}
+
 static void StretchPage(bool on) {
     if (!on) {
         for (auto& p : t_stretch)
@@ -1910,9 +1920,8 @@ static void StretchPage(bool on) {
         return;
     }
     if (t_sliding) return;
-    for (auto h : FindNodes(L"ContentHost")) {
-        auto fe = Obj<mux::FrameworkElement>(h);
-        if (!fe || fe.ActualHeight() < 1) continue;
+    for (auto const& fe : PageContentHosts()) {
+        if (fe.ActualHeight() < 1) continue;
         PageStretch* st = nullptr;
         for (auto& p : t_stretch)
             if (p.host.get() == fe) st = &p;
@@ -1952,7 +1961,7 @@ static void UpdateSquareCorners() {
         bool ok;
         if (fe && SmallRounded(GetRadius(fe, ok))) t_corners.push_back({winrt::make_weak(fe), GetRadius(fe, ok)}), SetRadius(fe, {0, 0, 0, 0});
     }
-    for (auto h : FindNodes(L"ContentHost")) SquareUnder(Obj<mux::DependencyObject>(h), 0);
+    for (auto const& fe : PageContentHosts()) SquareUnder(fe, 0);
     t_corners.erase(std::remove_if(t_corners.begin(), t_corners.end(), [](const CornerState& c) { return !c.el.get(); }),
                     t_corners.end());
 }
@@ -2335,9 +2344,8 @@ static void Park(const mux::FrameworkElement& el) {
 // While parked they're held at 0, so the page keeps its size.
 static void CapPageEdges() {
     if (!t_tidy.caps.empty()) return;
-    for (auto h : FindNodes(L"ContentHost")) {
-        auto host = Obj<mux::FrameworkElement>(h);
-        if (!host || !host.IsLoaded()) continue;
+    for (auto const& host : PageContentHosts()) {
+        if (!host.IsLoaded()) continue;
         auto card = FirstIn(host, [](const mux::FrameworkElement& fe) {
             auto g = fe.try_as<muxc::Grid>();
             return g && g.RowDefinitions().Size() == 3 && g.ColumnDefinitions().Size() == 3;
