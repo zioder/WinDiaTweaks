@@ -21,6 +21,7 @@ struct TweakInfo {
 // ---- provided by tap.cpp
 void Engine_Log(const char* fmt, ...);
 std::wstring Engine_Dir();
+void Engine_AvContained();
 std::vector<TweakInfo> Engine_Tweaks();
 bool Engine_TweakOn(const std::wstring& key);
 std::wstring Engine_TweakValue(const std::wstring& key);

@@ -347,6 +347,11 @@ static void RunProbe() {
             o << Media_DebugColors();
             continue;
         }
+        if (nm == L"MEDIAFAULT") {  // the media worker's contained fault, made on purpose (for testing)
+            extern std::string Media_DebugFault();
+            o << Media_DebugFault();
+            continue;
+        }
         if (nm == L"TIDYPROMPT") {  // the prompt Tidy would send now
             extern std::string Tidy_PromptText();
             o << Tidy_PromptText() << '\n';

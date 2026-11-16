@@ -111,6 +111,16 @@ std::atomic<bool> g_want{false}, g_running{false};
 std::atomic<int> g_sessionSequence{0};
 std::atomic<HANDLE> g_wake{nullptr};
 
+// g_mx as the worker takes it: the fault filter below needs to know whether this thread holds it.
+thread_local bool t_holdsMx = false;
+struct WorkerLock {
+    WorkerLock() { g_mx.lock(), t_holdsMx = true; }
+    ~WorkerLock() { t_holdsMx = false, g_mx.unlock(); }
+    WorkerLock(const WorkerLock&) = delete;
+    WorkerLock& operator=(const WorkerLock&) = delete;
+};
+std::atomic<bool> g_faultTest{false};  // `diatweaks probe MEDIAFAULT`
+
 Smtc Snapshot() {
     std::lock_guard lk(g_mx);
     return g_smtc;
@@ -155,6 +165,17 @@ bool IsPlaying(const wmc::GlobalSystemMediaTransportControlsSession& s) {
     return info && info.PlaybackStatus() == wmc::GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
 }
 
+// The fault the filter below contains, made on purpose: a call through a vtable that isn't there, with
+// a reference whose Release would fault the same way (`diatweaks probe MEDIAFAULT`).
+void FaultTestIfAsked() {
+    if (!g_faultTest.exchange(false)) return;
+    Log("media: fault test");
+    static void* badVtable = (void*)0x10;  // [vtable + 0x38] reads address 0x48: never mapped
+    wmc::GlobalSystemMediaTransportControlsSessionPlaybackInfo info{nullptr};
+    winrt::attach_abi(info, &badVtable);
+    (void)info.PlaybackStatus();
+}
+
 void WorkerBody() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     struct Apartment { ~Apartment() { winrt::uninit_apartment(); } } apartment;
@@ -195,6 +216,7 @@ void WorkerBody() {
     wss::IRandomAccessStream art{nullptr};
     while (g_want) {
         try {
+            FaultTestIfAsked();
             if (!mgr) {
                 mgr = Await(wmc::GlobalSystemMediaTransportControlsSessionManager::RequestAsync(), "session manager");
                 tokSessions = mgr.SessionsChanged(wake);
@@ -232,7 +254,7 @@ void WorkerBody() {
             }
             std::vector<Cmd> cmds;
             {
-                std::lock_guard lk(g_mx);
+                WorkerLock lk;
                 cmds.swap(g_cmds);
             }
             for (Cmd c : cmds) {
@@ -354,7 +376,7 @@ void WorkerBody() {
                 s.session = session;
             }
             {
-                std::lock_guard lk(g_mx);
+                WorkerLock lk;
                 g_smtc = s;
             }
         } catch (winrt::hresult_error const& e) {
@@ -379,19 +401,88 @@ void Worker() noexcept {
         Log("media: worker stopped after an exception");
     }
     {
-        std::lock_guard lk(g_mx);
+        WorkerLock lk;
         g_smtc = {};
         g_cmds.clear();
     }
     g_running = false;
 }
 
+// Windows' media session objects can be freed under us while a session closes: GetPlaybackInfo has
+// handed back an object whose vtable was already gone, and the next call on it was an access violation
+// that took Dia down (twice, hours in). A null check can't see that, so that one fault is contained:
+// the filter runs on the faulting thread before anything is unwound and ends the thread right there.
+// Nothing on its stack is destroyed, so no Release goes through the bad pointers (they leak, on purpose),
+// and g_wake stays open for the event handlers left registered. RunWorker starts a new worker later.
+//
+// Only that exact fault: a call through a vtable (call [mem]) in this add-on's own code, with g_mx not
+// held by this thread. At such a call nothing holds a lock, so ending the thread leaves none taken. A
+// fault anywhere else (inside Windows' code, which may hold its own locks, or a bug of ours) is left to
+// crash Dia as before: a thread ended there could leave a lock taken and hang Dia, which is worse.
+std::atomic<int> g_faults{0};
+std::atomic<ULONGLONG> g_faultAt{0};
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+bool VtableCallFault(const EXCEPTION_RECORD* er) {
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return false;
+    auto base = (const BYTE*)&__ImageBase;
+    auto nt = (const IMAGE_NT_HEADERS*)(base + __ImageBase.e_lfanew);
+    auto at = (const BYTE*)er->ExceptionAddress;
+    if (at < base || at + 3 > base + nt->OptionalHeader.SizeOfImage) return false;
+    if ((at[0] & 0xF0) == 0x40) at++;  // a REX prefix
+    return at[0] == 0xFF && ((at[1] >> 3) & 7) == 2 && (at[1] >> 6) != 3;  // FF /2 with a memory operand
+}
+
+LONG WorkerFault(EXCEPTION_POINTERS* ep) {
+    if (t_holdsMx || !VtableCallFault(ep->ExceptionRecord)) return EXCEPTION_CONTINUE_SEARCH;
+    {
+        std::lock_guard lk(g_mx);  // (the UI thread only holds it for a copy)
+        g_smtc = {};
+        g_cmds.clear();
+    }
+    Engine_AvContained();  // (crash.log keeps room for a real crash)
+    g_faultAt = GetTickCount64();
+    g_faults++;
+    g_running = false;
+    ExitThread(0);
+}
+
+void GuardedWorker() {
+    __try {
+        Worker();
+    } __except (WorkerFault(GetExceptionInformation())) {
+    }
+}
+
 void RunWorker(bool on) {
     g_want = on;
+    if (on && !g_running && g_faults > 0) {
+        // After a contained fault: a new worker 3 s later, unless that was the third within an hour (then
+        // once the oldest of them is an hour old). Every UI thread runs this, hence the lock.
+        static std::mutex mx;
+        static int handled = 0;
+        static std::vector<ULONGLONG> recent;
+        static bool pausedLogged = false;
+        std::lock_guard lk(mx);
+        ULONGLONG now = GetTickCount64();
+        if (g_faults != handled) {
+            if (now - g_faultAt < 3000) return;
+            handled = g_faults;
+            recent.push_back(g_faultAt);
+            pausedLogged = false;
+            Log("media: worker hit a bad system media object (contained, %d this session)", handled);
+        }
+        std::erase_if(recent, [&](ULONGLONG t) { return now - t > 3600 * 1000; });
+        if (recent.size() >= 3) {
+            if (!pausedLogged) Log("media: 3 bad system media objects within an hour; media controls pause for a while");
+            pausedLogged = true;
+            return;
+        }
+    }
     if (on && !g_running.exchange(true)) {
         if (!g_wake) g_wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!g_wake) { g_running = false; return; }
-        try { std::thread(Worker).detach(); }
+        try { std::thread(GuardedWorker).detach(); }
         catch (...) { g_running = false; Log("media: couldn't start metadata worker"); }
     } else if (!on && g_wake) {
         SetEvent(g_wake);
@@ -2168,6 +2259,15 @@ void Media_Tick() {
     }
 }
 
+
+// `diatweaks probe MEDIAFAULT`: the media worker makes the fault its filter contains (Dia should stay up,
+// and tap.log say "contained").
+std::string Media_DebugFault() {
+    if (!g_running) return "media worker isn't running (Media Controls off, or paused after faults)\n";
+    g_faultTest = true;
+    if (g_wake) SetEvent(g_wake);
+    return "fault asked of the media worker: see tap.log\n";
+}
 
 // `diatweaks probe COLORS`: the colorful brushes on screen and where, and colorful app resources (to find
 // where Dia keeps a profile's color).

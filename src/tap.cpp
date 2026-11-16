@@ -1245,6 +1245,12 @@ static HANDLE g_crashFile = INVALID_HANDLE_VALUE;
 static char g_crashTweaks[1024] = "";  // enabled tweaks, kept ready (the handler can't take locks)
 static std::atomic<int> g_crashReports{0}, g_avReports{0};
 
+// An access violation the add-on contained itself (media.cpp's worker): its report stays, but it doesn't
+// count toward the three, so a real crash later still gets one.
+void Engine_AvContained() {
+    if (g_avReports > 0) g_avReports--;
+}
+
 static void NoteTweaksForCrashReport() {
     std::string s;
     for (auto& t : g_tweaks)
@@ -1263,7 +1269,7 @@ static void CrashWrite(const char* s) {
 }
 
 // "Dia.dll+0x1234 ($s3Dia7TabViewC6updateyyF+0x40)". Reads only the module's own headers.
-static void DescribeAddress(DWORD64 addr, char* out, size_t cap) {
+static void DescribeAddress(DWORD64 addr, char* out, size_t cap, bool code = true) {
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)addr, &m) || !m) {
@@ -1280,7 +1286,7 @@ static void DescribeAddress(DWORD64 addr, char* out, size_t cap) {
     DWORD bestRva = 0;
     auto nt = (IMAGE_NT_HEADERS*)(img + ((IMAGE_DOS_HEADER*)img)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    if (dir.VirtualAddress && dir.Size) {
+    if (code && dir.VirtualAddress && dir.Size) {  // (the nearest export says nothing about data)
         auto ex = (IMAGE_EXPORT_DIRECTORY*)(img + dir.VirtualAddress);
         auto names = (DWORD*)(img + ex->AddressOfNames);
         auto ords = (WORD*)(img + ex->AddressOfNameOrdinals);
@@ -1335,8 +1341,15 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
     CrashWrite(line);
     snprintf(line, sizeof(line), "tweaks on: %s\r\n", g_crashTweaks[0] ? g_crashTweaks : "(none)");
     CrashWrite(line);
-    CONTEXT ctx = *ep->ContextRecord;
     char where[700];
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        // What it touched: an address inside a module (an unloaded one shows as a bare address) or the heap.
+        ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
+        DescribeAddress(ep->ExceptionRecord->ExceptionInformation[1], where, sizeof(where), kind == 8);
+        snprintf(line, sizeof(line), "  %s %s\r\n", kind == 1 ? "writing" : kind == 8 ? "executing" : "reading", where);
+        CrashWrite(line);
+    }
+    CONTEXT ctx = *ep->ContextRecord;
     for (int i = 0; i < 64 && ctx.Rip; i++) {
         DescribeAddress(ctx.Rip, where, sizeof(where));
         snprintf(line, sizeof(line), "  %2d %s\r\n", i, where);
