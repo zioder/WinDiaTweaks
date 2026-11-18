@@ -8274,6 +8274,168 @@ static void SetArcKeys(bool on) {
     }
 }
 
+// ---------------------------------------------------------------- Ctrl+1–9 spaces, Undo closing a tab
+// Two key tweaks after DiaTweaks' Switch Profiles with ⌘1–9 and Undo Closing a Tab (macOS), on one hook
+// thread that runs only while either is on.
+//
+// Ctrl+1–9 spaces (#81): Dia switches spaces with Alt and a number, and goes to tab N with Ctrl and a
+// number. The tweak swaps the two: Ctrl+1–9 switches spaces, Alt+1–9 goes to tabs. The key is taken
+// from Dia and sent again with the other modifier (top-row digits only, no Shift or Win).
+//
+// Undo closing a tab: Ctrl+Z right after a tab closes brings it back (Dia's own Reopen Closed Tab,
+// Ctrl+Shift+T), as long as you haven't typed or clicked since. A close is a tab row leaving the
+// sidebar's lists (Ctrl+W, ✕, middle-click, the menu: all the same). In Dia's own text boxes (the
+// address bar...) with something to undo, Ctrl+Z stays theirs.
+static const ULONG_PTR kKeysTag = 0x44544B59;  // marks the keys we send ('DTKY'): the hook lets them by
+static std::atomic<bool> g_spaceKeys{false}, g_undoClose{false};
+static std::atomic<bool> g_undoArmed{false};  // a tab just closed and nothing typed or clicked since
+static std::atomic<bool> g_textUndo{false};   // focus in Dia's own text box, with something to undo
+static std::atomic<unsigned> g_swappedDigits{0};  // digits whose press we sent on: their release too
+
+static void SendTagged(std::initializer_list<std::pair<WORD, bool>> keys) {  // (vk, down)
+    INPUT in[16]{};
+    UINT n = 0;
+    for (auto& [vk, down] : keys) {
+        if (n == 16) break;
+        in[n].type = INPUT_KEYBOARD;
+        in[n].ki.wVk = vk;
+        in[n].ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+        in[n++].ki.dwExtraInfo = kKeysTag;
+    }
+    SendInput(n, in, sizeof(INPUT));
+}
+
+static bool IsModifierKey(DWORD vk) {
+    switch (vk) {
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT: case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU: case VK_LWIN: case VK_RWIN: case VK_CAPITAL:
+        return true;
+    }
+    return false;
+}
+
+static LRESULT CALLBACK SpaceKeysHook(int code, WPARAM wp, LPARAM lp) {
+    if (code != HC_ACTION) return CallNextHookEx(nullptr, code, wp, lp);
+    auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
+    if (k->dwExtraInfo == kKeysTag) return CallNextHookEx(nullptr, code, wp, lp);
+    bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
+    DWORD vk = k->vkCode;
+    bool digit = vk >= '1' && vk <= '9';
+    unsigned bit = digit ? 1u << (vk - '0') : 0;
+    if (!down) {
+        if (bit && (g_swappedDigits.fetch_and(~bit) & bit)) return 1;  // (its press was sent on as another key)
+        return CallNextHookEx(nullptr, code, wp, lp);
+    }
+    if (IsModifierKey(vk)) return CallNextHookEx(nullptr, code, wp, lp);
+    bool armed = g_undoArmed.exchange(false);  // any key but a modifier: too late to undo after it
+    bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
+         shift = GetAsyncKeyState(VK_SHIFT) & 0x8000,
+         win = (GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000;
+    if (shift || win || ctrl == alt || !DiaIsForeground()) return CallNextHookEx(nullptr, code, wp, lp);
+    if (vk == 'Z' && ctrl && armed && g_undoClose && !g_textUndo) {
+        SendTagged({{VK_SHIFT, true}, {'T', true}, {'T', false}, {VK_SHIFT, false}});  // (Ctrl is held)
+        return 1;
+    }
+    if (digit && g_spaceKeys) {
+        WORD d = (WORD)vk;
+        g_swappedDigits |= bit;
+        // 0xE8 (unassigned) between: an Alt that goes up with no key since would open the window menu.
+        if (ctrl) SendTagged({{VK_CONTROL, false}, {VK_MENU, true}, {d, true}, {d, false}, {VK_MENU, false}, {VK_CONTROL, true}});
+        else SendTagged({{0xE8, true}, {0xE8, false}, {VK_MENU, false}, {VK_CONTROL, true}, {d, true}, {d, false},
+                         {VK_CONTROL, false}, {VK_MENU, true}});
+        return 1;
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+static LRESULT CALLBACK SpaceMouseHook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_LBUTTONDOWN || wp == WM_RBUTTONDOWN || wp == WM_MBUTTONDOWN || wp == WM_XBUTTONDOWN))
+        g_undoArmed = false;  // a click: too late to undo after it (a click on ✕ closes after this)
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+static LowLevelHookThread g_spaceHooks;
+static bool PeekWindowShown();
+
+static void SetSpaceKeys(bool spaces, bool undo) {
+    g_spaceKeys = spaces;
+    g_undoClose = undo;
+    if (!undo) g_undoArmed = false;
+    static DWORD owner = 0;  // (one UI thread starts and stops the hooks)
+    if (!owner) {
+        if (!spaces && !undo) return;
+        owner = GetCurrentThreadId();
+    }
+    if (GetCurrentThreadId() != owner) return;
+    static bool failed = false, mouse = false;
+    bool on = spaces || undo;
+    if (!on) failed = false;
+    if (on && g_spaceHooks.Running() && mouse != undo) g_spaceHooks.Stop();  // (the mouse hook only for undo)
+    if (on == g_spaceHooks.Running() || (on && failed)) return;
+    if (!on) {
+        g_spaceHooks.Stop();
+        g_swappedDigits = 0;
+    } else if (!g_spaceHooks.Start(undo ? SpaceMouseHook : nullptr, SpaceKeysHook)) {
+        failed = true;
+        Log("space keys: hook failed %lu", g_spaceHooks.Error());
+    } else {
+        mouse = undo;
+        Log("space keys: hook on (spaces %d, undo close %d)", spaces, undo);
+    }
+}
+
+// Tab rows on this thread (all of them: other spaces' too, folders' too), counted when the tree changes.
+static int CountTabRows() {
+    std::set<void*> seen;
+    for (auto h : FindNodes(L"RowsPanel"))
+        if (auto rows = Obj<mux::FrameworkElement>(h))
+            FirstIn(rows, [&](const mux::FrameworkElement& fe) {
+                if (auto uc = fe.try_as<muxc::UserControl>())
+                    if (auto g = uc.Content().try_as<muxc::Grid>(); g && g.ColumnDefinitions().Size() == 5)
+                        seen.insert(winrt::get_abi(fe));
+                return false;
+            });
+    return (int)seen.size();
+}
+
+// Dia's own text box (or rich box) focused in the active window, with something to undo.
+static bool FocusedTextCanUndo() {
+    HWND fg = GetForegroundWindow();
+    std::set<void*> roots;
+    for (auto h : FindNodes(L"RowsPanel")) {
+        auto fe = Obj<mux::FrameworkElement>(h);
+        auto root = fe ? fe.XamlRoot() : nullptr;
+        if (!root || !roots.insert(winrt::get_abi(root)).second || TopWindowFor(root) != fg) continue;
+        auto f = mux::Input::FocusManager::GetFocusedElement(root);
+        if (auto tb = f.try_as<muxc::TextBox>()) return tb.CanUndo();
+        if (auto rb = f.try_as<muxc::RichEditBox>()) return rb.Document().CanUndo();
+        return false;
+    }
+    return false;
+}
+
+static void UpdateUndoClose() {
+    static thread_local unsigned long long revision = 0;
+    static thread_local int rows = -1;
+    static thread_local ULONGLONG peekSeen = 0;
+    if (!g_undoClose) {
+        rows = -1;
+        return;
+    }
+    if (PeekWindowShown()) peekSeen = GetTickCount64();  // (Peek closes its own tab: not one to bring back)
+    if (g_undoArmed) g_textUndo = FocusedTextCanUndo();
+    auto rev = Engine_TreeRevision();
+    if (rev == revision && rows >= 0) return;
+    revision = rev;
+    int n = CountTabRows();
+    if (rows >= 0 && n < rows && GetTickCount64() - peekSeen > 1500) {
+        g_textUndo = FocusedTextCanUndo();
+        g_undoArmed = true;
+        Log("undo close: %d -> %d tab rows, Ctrl+Z reopens", rows, n);
+    }
+    rows = n;
+}
+
 // The empty-bar mode ends when the command bar closes. (And the key hook hears where it stands.)
 static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
@@ -8856,6 +9018,7 @@ static void UpdateCaptionsForToolbar();
 static HWND TopWindowFor(const mux::XamlRoot& root);
 static HWND t_peekWindow = nullptr;
 void Ui_SetPeekWindow(HWND w) { t_peekWindow = w; }
+static bool PeekWindowShown() { return t_peekWindow != nullptr; }
 
 // Peek's preview window can't be resized, maximized or minimized (its edges, a double-click, Win+Up...).
 // False until WinUI has made its AppWindow.
@@ -9410,6 +9573,9 @@ bool Ui_Tick() {
         SetArcKeys(Engine_TweakOn(L"floatingNewTab"));
         if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())
             HookCommandBarPopovers();  // (Arc mode hooks them already)
+        stage = "spaceKeys";
+        SetSpaceKeys(Engine_TweakOn(L"ctrlSpaces"), Engine_TweakOn(L"undoCloseTab"));
+        UpdateUndoClose();
         stage = "newTab";
         UpdateNewTabMode();
         if (tick % 4 == 0) HookSidebarNewTabButtons(), UpdateSidebarNoDrag();
