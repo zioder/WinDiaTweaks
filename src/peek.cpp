@@ -2927,6 +2927,7 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 const ULONGLONG kLookMs = 60, kContentByMs = 1500;
+const int kMaxAligns = 30;  // tries to put the page exactly on the card (one per tick) before going on anyway
 bool HasContent(Peek* p, HWND page);
 
 void DiaTick() {
@@ -2994,7 +2995,17 @@ void DiaTick() {
     }
     p->aligns++;
     ULONGLONG now = GetTickCount64();
-    if (p->parked && AlignPage(p, page)) {
+    // Dia may not give the page the exact size asked for (Dia 1.8: a few pixels short whatever the window's
+    // size): after kMaxAligns tries it goes on as it is, clipped to the card (never waiting forever).
+    bool gaveUp = p->aligns > kMaxAligns;
+    if (p->parked && p->aligns == kMaxAligns + 1) {
+        RECT pr{}, t = p->target;
+        GetWindowRect(page, &pr);
+        OffsetRect(&t, p->park.x, p->park.y);
+        Log("peek: the page won't fit the card exactly (off by %ld,%ld,%ld,%ld): shown as it is", pr.left - t.left,
+            pr.top - t.top, pr.right - t.right, pr.bottom - t.bottom);
+    }
+    if (p->parked && (AlignPage(p, page) || gaveUp)) {
         // Past WinUI's default frame: onto the screen, still clipped to nothing, so the page draws there
         // (Dia doesn't draw a page it counts as off screen) before it's shown.
         p->parked = false;
@@ -3005,7 +3016,7 @@ void DiaTick() {
         return;
     }
     if (p->parked) return;
-    if (!AlignPage(p, page) && p->aligns <= 30) {
+    if (!AlignPage(p, page) && p->aligns <= kMaxAligns) {  // (past it, from parked: shown without waiting more)
         p->placedAt = 0;
         return;
     }
