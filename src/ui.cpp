@@ -6301,7 +6301,15 @@ static void FlushArcTrailing(ArcState& st) {
         for (mux::DependencyObject d = url; d; d = muxm::VisualTreeHelper::GetParent(d)) chain.push_back(d);
         for (mux::DependencyObject d = host; d;) {
             auto parent = muxm::VisualTreeHelper::GetParent(d);
-            if (!parent) break;
+            if (!parent) {
+                // No panel in common: the sidebar is floating, in a popup of its own. Dia 1.8 moves the
+                // sidebar's branch there as it is, so the z -1 we gave it would draw it under the popup's
+                // own background (an empty floating sidebar). Dia's z back until it's docked again.
+                for (auto& [w, z] : st.zSaved)
+                    if (auto el = w.get()) muxc::Canvas::SetZIndex(el, z);
+                st.zSaved.clear();
+                break;
+            }
             if (std::find(chain.begin(), chain.end(), parent) == chain.end()) {
                 d = parent;
                 continue;
