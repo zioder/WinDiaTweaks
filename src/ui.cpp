@@ -55,6 +55,7 @@
 #include <audioclient.h>
 
 #include "engine.h"
+#include <commctrl.h>
 #include "llhook.h"
 
 namespace wf = winrt::Windows::Foundation;
@@ -9160,6 +9161,74 @@ static HWND TopWindowFor(const mux::XamlRoot& root) {
     return ctx.best;
 }
 
+// ---- Edge-to-edge: a maximized window that sits inside the screen.
+// Dia 1.8 can maximize its window onto the screen's exact rectangle (it covers the taskbar too)
+// instead of hanging the window's frame off the screen's edges as Windows does. The frame is then
+// inside the screen: an empty band all around the window with the desktop showing through, and the
+// pointer at the very top of the screen is on that band, not on the window's top (so a hidden toolbar
+// doesn't come back on hover). With edge-to-edge on, such a window's page fills all of it.
+static bool InsideScreen(const RECT& win) {
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(MonitorFromRect(&win, MONITOR_DEFAULTTONEAREST), &mi)) return false;
+    const RECT& m = mi.rcMonitor;
+    return win.left >= m.left && win.top >= m.top && win.right <= m.right && win.bottom <= m.bottom;
+}
+
+static const UINT_PTR kEdgeFrameId = 0x45324545;  // 'E2EE'
+
+static LRESULT CALLBACK EdgeFrameProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR) {
+    if (msg == WM_NCCALCSIZE && wp && IsZoomed(h)) {
+        auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+        RECT win = p->rgrc[0];  // the window's new rectangle (Dia's answer turns it into the page's)
+        LRESULT r = DefSubclassProc(h, msg, wp, lp);
+        if (InsideScreen(win)) p->rgrc[0] = win;
+        return r;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, EdgeFrameProc, id);
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+static thread_local std::set<HWND> t_edgeFrames;
+
+// Has Windows ask the window for its frame again (only when it's maximized inside the screen, the one
+// case the answer changes).
+static void RefreshFrame(HWND w) {
+    RECT r;
+    if (IsZoomed(w) && GetWindowRect(w, &r) && InsideScreen(r))
+        SetWindowPos(w, nullptr, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+}
+
+static void UpdateEdgeFrames() {
+    bool on = Engine_TweakOn(L"edgeToEdge");
+    if (on) {
+        std::vector<HWND> wins;
+        EnumThreadWindows(GetCurrentThreadId(), [](HWND h, LPARAM lp) -> BOOL {
+            wchar_t cls[64];
+            GetClassNameW(h, cls, 64);
+            if (!wcscmp(cls, L"WinUIDesktopWin32WindowClass") && h != t_peekWindow && FindSink(h))
+                reinterpret_cast<std::vector<HWND>*>(lp)->push_back(h);
+            return TRUE;
+        }, (LPARAM)&wins);
+        for (HWND w : wins)
+            if (!t_edgeFrames.count(w) && SetWindowSubclass(w, EdgeFrameProc, kEdgeFrameId, 0)) {
+                t_edgeFrames.insert(w);
+                RefreshFrame(w);
+            }
+    }
+    for (auto it = t_edgeFrames.begin(); it != t_edgeFrames.end();) {
+        if (IsWindow(*it) && on) {
+            ++it;
+            continue;
+        }
+        if (IsWindow(*it)) {
+            RemoveWindowSubclass(*it, EdgeFrameProc, kEdgeFrameId);
+            RefreshFrame(*it);  // (Dia's own frame back)
+        }
+        it = t_edgeFrames.erase(it);
+    }
+}
+
 HWND Ui_TopWindowFor(const mux::XamlRoot& root) { return TopWindowFor(root); }  // (media.cpp)
 
 // The empty space that drags the window, in window pixels, as in Arc's title bar: in Arc (Windows) the
@@ -9426,6 +9495,7 @@ bool Ui_Tick() {
         if (tick % 3 == 0) {
             stage = "look";
             UpdateWindowMaterial();
+            UpdateEdgeFrames();
             UpdateToolbarLook();
             UpdateAddressField();
             UpdateProfileEmoji();
