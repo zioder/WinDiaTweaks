@@ -85,6 +85,7 @@ bool Ui_PeekShowTabMenu(HWND window);
 bool Ui_PeekMenuOpen(HWND win);  // a menu (or any popup) open on the preview's window
 void Ui_PeekCloseTabMenu(HWND window);
 void Peek_BeforeMove();  // (peek.cpp: just before the tab moves)
+void Peek_DescribeForCrash(char* buf, size_t size);  // (peek.cpp: for the crash report, lock-free)
 
 // ---- provided by history.cpp (Hide history suggestions)
 // Runs every timer tick on each UI thread.
