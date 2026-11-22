@@ -678,6 +678,10 @@ static bool PointerAtTop(DWORD uiThread, bool shown) {
     UINT dpi = GetDpiForWindow(root);
     if (!dpi) dpi = 96;
     int y = pt.y - origin.y;
+    // Dia 1.8 can maximize its window with the frame inside the screen (see ui.cpp, edge-to-edge): the
+    // pointer pushed to the top of the screen is then on that frame, just above the window's top.
+    RECT wr;
+    if (y < 0 && IsZoomed(root) && GetWindowRect(root, &wr) && pt.y >= wr.top) y = 0;
     int showBand = MulDiv(6, dpi, 96), keepBand = MulDiv(52, dpi, 96);
     return y >= 0 && y < (shown ? keepBand : showBand);
 }
