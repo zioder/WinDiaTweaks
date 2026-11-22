@@ -2022,7 +2022,24 @@ void KeepHidden(HWND w) {
 // kept even though Windows caps a window near the screen's size while it handles the move.
 SIZE g_wantSize{};
 
+// For the crash report (zioder/WinDiaTweaks#82): the messages the preview's window is in the middle of
+// handling (innermost last), and when Dia made it. Only plain atomics: the crash handler reads them.
+const int kMsgDepth = 8;
+std::atomic<UINT> g_inMsg[kMsgDepth];
+std::atomic<int> g_inMsgDepth{0};
+std::atomic<ULONGLONG> g_peekWindowAt{0};
+
+LRESULT FixedProcBody(HWND h, UINT msg, WPARAM wp, LPARAM lp);
+
 LRESULT CALLBACK FixedProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    int d = g_inMsgDepth.fetch_add(1);
+    if (d >= 0 && d < kMsgDepth) g_inMsg[d] = msg;
+    LRESULT r = FixedProcBody(h, msg, wp, lp);
+    g_inMsgDepth.fetch_sub(1);
+    return r;
+}
+
+LRESULT FixedProcBody(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_WINDOWPOSCHANGING && g_wantSize.cx > 0) {
         LRESULT r = DefSubclassProc(h, msg, wp, lp);
         auto* pos = reinterpret_cast<WINDOWPOS*>(lp);
@@ -2898,7 +2915,9 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wp, LPARAM lp) {
             c->lpcs->y = t.top - g_offset.dy + p->park.y;
             c->lpcs->cx = t.right - t.left + g_offset.dw;
             c->lpcs->cy = t.bottom - t.top + g_offset.dh;
-            Log("peek: Dia window after %llu ms", GetTickCount64() - p->started);
+            g_peekWindowAt = GetTickCount64();
+            Log("peek: Dia window after %llu ms (inject step %d%s)", GetTickCount64() - p->started, p->injectStep,
+                p->warm ? ", warm" : "");
         }
     } else if (code == HCBT_MINMAX && g_peek && (HWND)wp == g_peek->win) {
         int cmd = LOWORD(lp);
@@ -2908,6 +2927,7 @@ LRESULT CALLBACK CbtHook(int code, WPARAM wp, LPARAM lp) {
 }
 
 const ULONGLONG kLookMs = 60, kContentByMs = 1500;
+const int kMaxAligns = 30;  // tries to put the page exactly on the card (one per tick) before going on anyway
 bool HasContent(Peek* p, HWND page);
 
 void DiaTick() {
@@ -2975,7 +2995,17 @@ void DiaTick() {
     }
     p->aligns++;
     ULONGLONG now = GetTickCount64();
-    if (p->parked && AlignPage(p, page)) {
+    // Dia may not give the page the exact size asked for (Dia 1.8: a few pixels short whatever the window's
+    // size): after kMaxAligns tries it goes on as it is, clipped to the card (never waiting forever).
+    bool gaveUp = p->aligns > kMaxAligns;
+    if (p->parked && p->aligns == kMaxAligns + 1) {
+        RECT pr{}, t = p->target;
+        GetWindowRect(page, &pr);
+        OffsetRect(&t, p->park.x, p->park.y);
+        Log("peek: the page won't fit the card exactly (off by %ld,%ld,%ld,%ld): shown as it is", pr.left - t.left,
+            pr.top - t.top, pr.right - t.right, pr.bottom - t.bottom);
+    }
+    if (p->parked && (AlignPage(p, page) || gaveUp)) {
         // Past WinUI's default frame: onto the screen, still clipped to nothing, so the page draws there
         // (Dia doesn't draw a page it counts as off screen) before it's shown.
         p->parked = false;
@@ -2986,7 +3016,7 @@ void DiaTick() {
         return;
     }
     if (p->parked) return;
-    if (!AlignPage(p, page) && p->aligns <= 30) {
+    if (!AlignPage(p, page) && p->aligns <= kMaxAligns) {  // (past it, from parked: shown without waiting more)
         p->placedAt = 0;
         return;
     }
@@ -3463,6 +3493,22 @@ void SetInputHooks(bool on) {
 }  // namespace
 
 void Peek_BeforeMove() { BeforeMove(); }
+
+// One line for the crash report: what Peek was doing. Called from the crash handler (no locks, no allocation).
+void Peek_DescribeForCrash(char* buf, size_t size) {
+    if (!g_hasPeek) {
+        snprintf(buf, size, "peek: none open\r\n");
+        return;
+    }
+    ULONGLONG at = g_peekWindowAt;
+    int depth = g_inMsgDepth;
+    int n = snprintf(buf, size, "peek: phase %d, inject step %d%s, Dia's window %lld ms old, in messages:",
+                     (int)g_peekPhase, (int)g_peekInject, g_peekWarm ? ", warm" : "",
+                     at ? (long long)(GetTickCount64() - at) : -1LL);
+    for (int i = 0; i < depth && i < kMsgDepth && n > 0 && (size_t)n < size; i++)
+        n += snprintf(buf + n, size - n, " 0x%04x", (UINT)g_inMsg[i]);
+    if (n > 0 && (size_t)n < size) snprintf(buf + n, size - n, "%s\r\n", depth ? "" : " none");
+}
 
 // Called every engine tick on each UI thread. The hooks live on the first UI thread that sees the tweak on.
 void Peek_Tick() {

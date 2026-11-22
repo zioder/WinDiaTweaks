@@ -1335,6 +1335,8 @@ static LONG CALLBACK CrashHandler(EXCEPTION_POINTERS* ep) {
     CrashWrite(line);
     snprintf(line, sizeof(line), "tweaks on: %s\r\n", g_crashTweaks[0] ? g_crashTweaks : "(none)");
     CrashWrite(line);
+    Peek_DescribeForCrash(line, sizeof(line));
+    CrashWrite(line);
     CONTEXT ctx = *ep->ContextRecord;
     char where[700];
     for (int i = 0; i < 64 && ctx.Rip; i++) {
